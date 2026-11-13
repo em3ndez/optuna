@@ -1,44 +1,50 @@
+from __future__ import annotations
+
 import functools
 import math
-from typing import KeysView
-from typing import List
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-import optuna
-from optuna._study_direction import StudyDirection
 from optuna.pruners import BasePruner
+from optuna.study._study_direction import StudyDirection
 from optuna.trial._state import TrialState
+
+
+if TYPE_CHECKING:
+    from collections.abc import KeysView
+
+    import optuna
 
 
 def _get_best_intermediate_result_over_steps(
     trial: "optuna.trial.FrozenTrial", direction: StudyDirection
 ) -> float:
-
     values = np.asarray(list(trial.intermediate_values.values()), dtype=float)
+    if values.size > 0 and np.isnan(values).all():
+        # `np.nanmin`/`np.nanmax` would return NaN for an all-NaN input anyway, but they also
+        # emit an "All-NaN slice encountered" RuntimeWarning while doing so.
+        return float("nan")
     if direction == StudyDirection.MAXIMIZE:
         return np.nanmax(values)
     return np.nanmin(values)
 
 
 def _get_percentile_intermediate_result_over_trials(
-    all_trials: List["optuna.trial.FrozenTrial"],
+    completed_trials: list["optuna.trial.FrozenTrial"],
     direction: StudyDirection,
     step: int,
     percentile: float,
     n_min_trials: int,
 ) -> float:
-
-    completed_trials = [t for t in all_trials if t.state == TrialState.COMPLETE]
-
     if len(completed_trials) == 0:
         raise ValueError("No trials have been completed.")
 
-    intermediate_values = [
-        t.intermediate_values[step] for t in completed_trials if step in t.intermediate_values
-    ]
-
-    if len(intermediate_values) < n_min_trials:
+    intermediate_values = np.array(
+        [t.intermediate_values[step] for t in completed_trials if step in t.intermediate_values],
+        dtype=float,
+    )
+    if len(intermediate_values) < n_min_trials or np.isnan(intermediate_values).all():
         return math.nan
 
     if direction == StudyDirection.MAXIMIZE:
@@ -46,7 +52,7 @@ def _get_percentile_intermediate_result_over_trials(
 
     return float(
         np.nanpercentile(
-            np.array(intermediate_values, dtype=float),
+            intermediate_values,
             percentile,
         )
     )
@@ -55,7 +61,6 @@ def _get_percentile_intermediate_result_over_trials(
 def _is_first_in_interval_step(
     step: int, intermediate_steps: KeysView[int], n_warmup_steps: int, interval_steps: int
 ) -> bool:
-
     nearest_lower_pruning_step = (
         step - n_warmup_steps
     ) // interval_steps * interval_steps + n_warmup_steps
@@ -124,8 +129,9 @@ class PercentilePruner(BasePruner):
         n_startup_trials:
             Pruning is disabled until the given number of trials finish in the same study.
         n_warmup_steps:
-            Pruning is disabled until the trial exceeds the given number of step. Note that
-            this feature assumes that ``step`` starts at zero.
+            Pruning is disabled while the current step is less than ``n_warmup_steps``; the
+            earliest a trial can be pruned is at ``step == n_warmup_steps``. This feature
+            assumes that ``step`` is a non-negative integer.
         interval_steps:
             Interval in number of steps between the pruning checks, offset by the warmup steps.
             If no value has been reported at the time of a pruning check, that particular check
@@ -146,26 +152,25 @@ class PercentilePruner(BasePruner):
         *,
         n_min_trials: int = 1,
     ) -> None:
-
         if not 0.0 <= percentile <= 100:
             raise ValueError(
-                "Percentile must be between 0 and 100 inclusive but got {}.".format(percentile)
+                f"Percentile must be between 0 and 100 inclusive, but got {percentile=}."
             )
         if n_startup_trials < 0:
             raise ValueError(
-                "Number of startup trials cannot be negative but got {}.".format(n_startup_trials)
+                f"Number of startup trials cannot be negative, but got {n_startup_trials=}."
             )
         if n_warmup_steps < 0:
             raise ValueError(
-                "Number of warmup steps cannot be negative but got {}.".format(n_warmup_steps)
+                f"Number of warmup steps cannot be negative, but got {n_warmup_steps=}."
             )
         if interval_steps < 1:
             raise ValueError(
-                "Pruning interval steps must be at least 1 but got {}.".format(interval_steps)
+                f"Pruning interval steps must be at least 1, but got {interval_steps=}."
             )
         if n_min_trials < 1:
             raise ValueError(
-                "Number of trials for pruning must be at least 1 but got {}.".format(n_min_trials)
+                f"Number of trials for pruning must be at least 1, but got {n_min_trials=}."
             )
 
         self._percentile = percentile
@@ -175,9 +180,8 @@ class PercentilePruner(BasePruner):
         self._n_min_trials = n_min_trials
 
     def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
-
-        all_trials = study.get_trials(deepcopy=False)
-        n_trials = len([t for t in all_trials if t.state == TrialState.COMPLETE])
+        completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+        n_trials = len(completed_trials)
 
         if n_trials == 0:
             return False
@@ -204,7 +208,7 @@ class PercentilePruner(BasePruner):
             return True
 
         p = _get_percentile_intermediate_result_over_trials(
-            all_trials, direction, step, self._percentile, self._n_min_trials
+            completed_trials, direction, step, self._percentile, self._n_min_trials
         )
         if math.isnan(p):
             return False

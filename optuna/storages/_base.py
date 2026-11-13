@@ -1,18 +1,16 @@
-import abc
-from typing import Any
-from typing import Callable
-from typing import cast
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+from __future__ import annotations
 
-import optuna
-from optuna._study_direction import StudyDirection
-from optuna._study_summary import StudySummary
+import abc
+from collections.abc import Container
+from collections.abc import Sequence
+from typing import Any
+from typing import cast
+
+from optuna._typing import JSONSerializable
 from optuna.distributions import BaseDistribution
+from optuna.exceptions import UpdateFinishedTrialError
+from optuna.study._frozen import FrozenStudy
+from optuna.study._study_direction import StudyDirection
 from optuna.trial import FrozenTrial
 from optuna.trial import TrialState
 
@@ -20,19 +18,25 @@ from optuna.trial import TrialState
 DEFAULT_STUDY_NAME_PREFIX = "no-name-"
 
 
-class BaseStorage(object, metaclass=abc.ABCMeta):
+class BaseStorage(abc.ABC):
     """Base class for storages.
 
     This class is not supposed to be directly accessed by library users.
 
-    A storage class abstracts a backend database and provides library internal interfaces to
+    This class abstracts a backend database and provides internal interfaces to
     read/write histories of studies and trials.
+
+    A storage class implementing this class must meet the following requirements.
 
     **Thread safety**
 
-    A storage class can be shared among multiple threads, and must therefore be thread-safe.
-    It must guarantee that return values such as `FrozenTrial`s are never modified.
-    A storage class can assume that return values are never modified by its user.
+    A storage class instance can be shared among multiple threads, and must therefore be
+    thread-safe. It must guarantee that a data instance read from the storage must not be modified
+    by subsequent writes. For example, `FrozenTrial` instance returned by `get_trial`
+    should not be updated by the subsequent `set_trial_xxx`. This is usually achieved by replacing
+    the old data with a copy on `set_trial_xxx`.
+
+    A storage class can also assume that a data instance returned are never modified by its user.
     When a user modifies a return value from a storage class, the internal state of the storage
     may become inconsistent. Consequences are undefined.
 
@@ -40,67 +44,24 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
 
     Trials in finished states are not allowed to be modified.
     Trials in the WAITING state are not allowed to be modified except for the `state` field.
-    A storage class can assume that each RUNNING trial is only modified from a single process.
-    When a user modifies a RUNNING trial from multiple processes, the internal state of the storage
-    may become inconsistent. Consequences are undefined.
-    A storage class is not intended for inter-process communication.
-    Consequently, users using optuna with MPI or other multi-process programs must make sure that
-    only one process is used to access the optuna interface.
-
-    **Consistency models**
-
-    A storage class must support the monotonic-reads consistency model, that is, if a
-    process reads data `X`, any successive reads on data `X` cannot return older values.
-    It must support read-your-writes, that is, if a process writes to data `X`,
-    any successive reads on data `X` from the same process must read the written
-    value or one of the more recent values.
-
-    **Stronger consistency requirements for special data**
-
-    Under a multi-worker setting, a storage class must return the latest values of any attributes
-    of a study, not necessarily for the attributes of a `Trial`.
-    However, if the `read_trials_from_remote_storage(study_id)` method is called, any successive
-    reads on the `state` attribute of a `Trial` are guaranteed to return the same or more recent
-    values than the value at the time of the call to the
-    `read_trials_from_remote_storage(study_id)` method.
-    Let `T` be a `Trial`.
-    Let `P` be the process that last updated the `state` attribute of `T`.
-    Then, any reads on any attributes of `T` are guaranteed to return the same or
-    more recent values than any writes by `P` on the attribute before `P` updated
-    the `state` attribute of `T`.
-    The same applies for `user_attrs', 'system_attrs' and 'intermediate_values` attributes.
-
-    .. note::
-
-        These attribute behaviors may become user customizable in the future.
-
-    **Data persistence**
-
-    A storage class does not guarantee that write operations are logged into a persistent
-    storage, even when write methods succeed.
-    Thus, when process failure occurs, some writes might be lost.
-    As exceptions, when a persistent storage is available, any writes on any attributes
-    of `Study` and writes on `state` of `Trial` are guaranteed to be persistent.
-    Additionally, any preceding writes on any attributes of `Trial` are guaranteed to
-    be written into a persistent storage before writes on `state` of `Trial` succeed.
-    The same applies for `param`, `user_attrs', 'system_attrs' and 'intermediate_values`
-    attributes.
-
-    .. note::
-
-        These attribute behaviors may become user customizable in the future.
     """
 
     # Basic study manipulation
 
     @abc.abstractmethod
-    def create_new_study(self, study_name: Optional[str] = None) -> int:
+    def create_new_study(
+        self, directions: Sequence[StudyDirection], study_name: str | None = None
+    ) -> int:
         """Create a new study from a name.
 
         If no name is specified, the storage class generates a name.
         The returned study ID is unique among all current and deleted studies.
 
         Args:
+            directions:
+                 A sequence of direction whose element is either
+                 :obj:`~optuna.study.StudyDirection.MAXIMIZE` or
+                 :obj:`~optuna.study.StudyDirection.MINIMIZE`.
             study_name:
                 Name of the new study to create.
 
@@ -111,7 +72,6 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
             :exc:`optuna.exceptions.DuplicatedStudyError`:
                 If a study with the same ``study_name`` already exists.
         """
-        # TODO(ytsmiling) Fix RDB storage implementation to ensure unique `study_id`.
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -149,7 +109,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def set_study_system_attr(self, study_id: int, key: str, value: Any) -> None:
+    def set_study_system_attr(self, study_id: int, key: str, value: JSONSerializable) -> None:
         """Register an optuna-internal attribute to a study.
 
         This method overwrites any existing attribute.
@@ -165,27 +125,6 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no study with the matching ``study_id`` exists.
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def set_study_directions(self, study_id: int, directions: Sequence[StudyDirection]) -> None:
-        """Register optimization problem directions to a study.
-
-        Args:
-            study_id:
-                ID of the study.
-            directions:
-                A sequence of direction whose element is either
-                :obj:`~optuna.study.StudyDirection.MAXIMIZE` or
-                :obj:`~optuna.study.StudyDirection.MINIMIZE`.
-
-        Raises:
-            :exc:`KeyError`:
-                If no study with the matching ``study_id`` exists.
-            :exc:`ValueError`:
-                If the directions are already set and the each coordinate of passed ``directions``
-                is the opposite direction or :obj:`~optuna.study.StudyDirection.NOT_SET`.
         """
         raise NotImplementedError
 
@@ -209,23 +148,6 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_study_id_from_trial_id(self, trial_id: int) -> int:
-        """Read the ID of a study to which a trial belongs.
-
-        Args:
-            trial_id:
-                ID of the trial.
-
-        Returns:
-            ID of the study.
-
-        Raises:
-            :exc:`KeyError`:
-                If no trial with the matching ``trial_id`` exists.
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
     def get_study_name_from_id(self, study_id: int) -> str:
         """Read the study name of a study.
 
@@ -243,7 +165,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_study_directions(self, study_id: int) -> List[StudyDirection]:
+    def get_study_directions(self, study_id: int) -> list[StudyDirection]:
         """Read whether a study maximizes or minimizes an objective.
 
         Args:
@@ -260,7 +182,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_study_user_attrs(self, study_id: int) -> Dict[str, Any]:
+    def get_study_user_attrs(self, study_id: int) -> dict[str, Any]:
         """Read the user-defined attributes of a study.
 
         Args:
@@ -277,7 +199,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_study_system_attrs(self, study_id: int) -> Dict[str, Any]:
+    def get_study_system_attrs(self, study_id: int) -> dict[str, Any]:
         """Read the optuna-internal attributes of a study.
 
         Args:
@@ -294,11 +216,11 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_all_study_summaries(self) -> List[StudySummary]:
-        """Read a list of :class:`~optuna.study.StudySummary` objects.
+    def get_all_studies(self) -> list[FrozenStudy]:
+        """Read a list of :class:`~optuna.study.FrozenStudy` objects.
 
         Returns:
-            A list of :class:`~optuna.study.StudySummary` objects.
+            A list of :class:`~optuna.study.FrozenStudy` objects, sorted by ``study_id``.
 
         """
         raise NotImplementedError
@@ -306,7 +228,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
     # Basic trial manipulation
 
     @abc.abstractmethod
-    def create_new_trial(self, study_id: int, template_trial: Optional[FrozenTrial] = None) -> int:
+    def create_new_trial(self, study_id: int, template_trial: FrozenTrial | None = None) -> int:
         """Create and add a new trial to a study.
 
         The returned trial ID is unique among all current and deleted trials.
@@ -315,7 +237,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
             study_id:
                 ID of the study.
             template_trial:
-                Template :class:`~optuna.trial.FronzenTrial` with default user-attributes,
+                Template :class:`~optuna.trial.FrozenTrial` with default user-attributes,
                 system-attributes, intermediate-values, and a state.
 
         Returns:
@@ -324,31 +246,6 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no study with the matching ``study_id`` exists.
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def set_trial_state(self, trial_id: int, state: TrialState) -> bool:
-        """Update the state of a trial.
-
-        Args:
-            trial_id:
-                ID of the trial.
-            state:
-                New state of the trial.
-
-        Returns:
-            :obj:`True` if the state is successfully updated.
-            :obj:`False` if the state is kept the same.
-            The latter happens when this method tries to update the state of
-            :obj:`~optuna.trial.TrialState.RUNNING` trial to
-            :obj:`~optuna.trial.TrialState.RUNNING`.
-
-        Raises:
-            :exc:`KeyError`:
-                If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
-                If the trial is already finished.
         """
         raise NotImplementedError
 
@@ -375,13 +272,13 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         raise NotImplementedError
 
     def get_trial_id_from_study_id_trial_number(self, study_id: int, trial_number: int) -> int:
-        """Read the trial id of a trial.
+        """Read the trial ID of a trial.
 
         Args:
             study_id:
@@ -396,9 +293,11 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
             :exc:`KeyError`:
                 If no trial with the matching ``study_id`` and ``trial_number`` exists.
         """
-        raise NotImplementedError
+        trials = self.get_all_trials(study_id, deepcopy=False)
+        if not 0 <= trial_number < len(trials):
+            raise KeyError(f"No trial with {trial_number=} exists in study with {study_id=}.")
+        return trials[trial_number]._trial_id
 
-    @abc.abstractmethod
     def get_trial_number_from_id(self, trial_id: int) -> int:
         """Read the trial number of a trial.
 
@@ -417,9 +316,8 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
         """
-        raise NotImplementedError
+        return self.get_trial(trial_id).number
 
-    @abc.abstractmethod
     def get_trial_param(self, trial_id: int, param_name: str) -> float:
         """Read the parameter of a trial.
 
@@ -437,24 +335,37 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
                 If no trial with the matching ``trial_id`` exists.
                 If no such parameter exists.
         """
-        raise NotImplementedError
+        trial = self.get_trial(trial_id)
+        return trial.distributions[param_name].to_internal_repr(trial.params[param_name])
 
     @abc.abstractmethod
-    def set_trial_values(self, trial_id: int, values: Sequence[float]) -> None:
-        """Set return values of an objective function.
+    def set_trial_state_values(
+        self, trial_id: int, state: TrialState, values: Sequence[float] | None = None
+    ) -> bool:
+        """Update the state and values of a trial.
 
-        This method overwrites any existing trial values.
+        Set return values of an objective function to values argument.
+        If values argument is not :obj:`None`, this method overwrites any existing trial values.
 
         Args:
             trial_id:
                 ID of the trial.
+            state:
+                New state of the trial.
             values:
                 Values of the objective function.
+
+        Returns:
+            :obj:`True` if the state is successfully updated.
+            :obj:`False` if the state is kept the same.
+            The latter happens when this method tries to update the state of
+            :obj:`~optuna.trial.TrialState.RUNNING` trial to
+            :obj:`~optuna.trial.TrialState.RUNNING`.
 
         Raises:
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         raise NotImplementedError
@@ -478,7 +389,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         raise NotImplementedError
@@ -500,13 +411,13 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def set_trial_system_attr(self, trial_id: int, key: str, value: Any) -> None:
+    def set_trial_system_attr(self, trial_id: int, key: str, value: JSONSerializable) -> None:
         """Set an optuna-internal attribute to a trial.
 
         This method overwrites any existing attribute.
@@ -522,7 +433,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         Raises:
             :exc:`KeyError`:
                 If no trial with the matching ``trial_id`` exists.
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         raise NotImplementedError
@@ -551,8 +462,8 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         self,
         study_id: int,
         deepcopy: bool = True,
-        states: Optional[Tuple[TrialState, ...]] = None,
-    ) -> List[FrozenTrial]:
+        states: Container[TrialState] | None = None,
+    ) -> list[FrozenTrial]:
         """Read all trials in a study.
 
         Args:
@@ -565,7 +476,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
                 Trial states to filter on. If :obj:`None`, include all states.
 
         Returns:
-            List of trials in the study.
+            List of trials in the study, sorted by ``trial_id``.
 
         Raises:
             :exc:`KeyError`:
@@ -574,7 +485,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     def get_n_trials(
-        self, study_id: int, state: Optional[Union[Tuple[TrialState, ...], TrialState]] = None
+        self, study_id: int, state: tuple[TrialState, ...] | TrialState | None = None
     ) -> int:
         """Count the number of trials in a study.
 
@@ -617,8 +528,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
             :exc:`ValueError`:
                 If no trials have been completed.
         """
-        all_trials = self.get_all_trials(study_id, deepcopy=False)
-        all_trials = [t for t in all_trials if t.state is TrialState.COMPLETE]
+        all_trials = self.get_all_trials(study_id, deepcopy=False, states=[TrialState.COMPLETE])
 
         if len(all_trials) == 0:
             raise ValueError("No trials are completed yet.")
@@ -637,7 +547,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
 
         return best_trial
 
-    def get_trial_params(self, trial_id: int) -> Dict[str, Any]:
+    def get_trial_params(self, trial_id: int) -> dict[str, Any]:
         """Read the parameter dictionary of a trial.
 
         Args:
@@ -645,7 +555,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
                 ID of the trial.
 
         Returns:
-            Dictionary of a parameters. Keys are parameter names and values are internal
+            Dictionary of a parameters. Keys are parameter names and values are external
             representations of the parameter values.
 
         Raises:
@@ -654,7 +564,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         """
         return self.get_trial(trial_id).params
 
-    def get_trial_user_attrs(self, trial_id: int) -> Dict[str, Any]:
+    def get_trial_user_attrs(self, trial_id: int) -> dict[str, Any]:
         """Read the user-defined attributes of a trial.
 
         Args:
@@ -670,7 +580,7 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
         """
         return self.get_trial(trial_id).user_attrs
 
-    def get_trial_system_attrs(self, trial_id: int) -> Dict[str, Any]:
+    def get_trial_system_attrs(self, trial_id: int) -> dict[str, Any]:
         """Read the optuna-internal attributes of a trial.
 
         Args:
@@ -685,19 +595,6 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
                 If no trial with the matching ``trial_id`` exists.
         """
         return self.get_trial(trial_id).system_attrs
-
-    def read_trials_from_remote_storage(self, study_id: int) -> None:
-        """Make an internal cache of trials up-to-date.
-
-        Args:
-            study_id:
-                ID of the study.
-
-        Raises:
-            :exc:`KeyError`:
-                If no study with the matching ``study_id`` exists.
-        """
-        raise NotImplementedError
 
     def remove_session(self) -> None:
         """Clean up all connections to a database."""
@@ -714,64 +611,11 @@ class BaseStorage(object, metaclass=abc.ABCMeta):
                 Trial state to check.
 
         Raises:
-            :exc:`RuntimeError`:
+            :exc:`~optuna.exceptions.UpdateFinishedTrialError`:
                 If the trial is already finished.
         """
         if trial_state.is_finished():
             trial = self.get_trial(trial_id)
-            raise RuntimeError(
-                "Trial#{} has already finished and can not be updated.".format(trial.number)
+            raise UpdateFinishedTrialError(
+                f"Trial#{trial.number} has already finished and can not be updated."
             )
-
-    def record_heartbeat(self, trial_id: int) -> None:
-        """Record the heartbeat of the trial.
-
-        Args:
-            trial_id:
-                ID of the trial.
-        """
-        pass
-
-    def fail_stale_trials(self, study_id: int) -> List[int]:
-        """Fail stale trials.
-
-        The running trials whose heartbeat has not been updated for a long time will be failed,
-        that is, those states will be changed to :obj:`~optuna.trial.TrialState.FAIL`.
-        The grace period is ``2 * heartbeat_interval``.
-
-        Args:
-            study_id:
-                ID of the related study.
-        Returns:
-            List of trial IDs of the failed trials.
-        """
-        pass
-
-    def is_heartbeat_enabled(self) -> bool:
-        """Check whether the storage enables the heartbeat.
-
-        Returns:
-            :obj:`True` if the storage supports the heartbeat and the return value of
-            :meth:`~optuna.storages.BaseStorage.get_heartbeat_interval` is an integer,
-            otherwise :obj:`False`.
-        """
-        return self._is_heartbeat_supported() and self.get_heartbeat_interval() is not None
-
-    def _is_heartbeat_supported(self) -> bool:
-        return False
-
-    def get_heartbeat_interval(self) -> Optional[int]:
-        """Get the heartbeat interval if it is set.
-
-        Returns:
-            The heartbeat interval if it is set, otherwise :obj:`None`.
-        """
-        return None
-
-    def get_failed_trial_callback(self) -> Optional[Callable[["optuna.Study", FrozenTrial], None]]:
-        """Get the failed trial callback function.
-
-        Returns:
-            The failed trial callback function if it is set, otherwise :obj:`None`.
-        """
-        return None

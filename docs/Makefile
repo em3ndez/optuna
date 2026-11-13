@@ -26,8 +26,14 @@ doctest:
 # Copy from https://sphinx-gallery.github.io/stable/advanced.html#cleaning-the-gallery-files
 clean:
 	rm -rf $(BUILDDIR)/*
-	rm -rf source/reference/generated/
-	rm -rf source/reference/multi_objective/generated/
-	rm -rf source/reference/visualization/generated/
-	rm -rf source/tutorial/
+	find source -type d -name generated -prune -exec rm -rf {} \;
+	rm -f source/sg_execution_times.rst
+	rm -rf source/tutorial/10_key_features
+	rm -rf source/tutorial/20_recipes
 	rm -f ../tutorial/**/*.db
+	rm -f ../tutorial/**/*.log
+	rm -rf ../tutorial/20_recipes/artifacts
+	rm -f ../tutorial/20_recipes/journal.log
+	rm -f ../tutorial/10_key_features/journal.log
+	rm -rf ../tutorial/20_recipes/tmp
+	rm -f ../tutorial/20_recipes/best_atoms.png

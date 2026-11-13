@@ -1,20 +1,18 @@
-from collections import OrderedDict
+from __future__ import annotations
+
 import math
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Tuple
-from typing import Union
+from typing import TYPE_CHECKING
 
-import numpy
+import numpy as np
 
-from optuna.distributions import BaseDistribution
 from optuna.distributions import CategoricalDistribution
-from optuna.distributions import DiscreteUniformDistribution
-from optuna.distributions import IntLogUniformDistribution
-from optuna.distributions import IntUniformDistribution
-from optuna.distributions import LogUniformDistribution
-from optuna.distributions import UniformDistribution
+from optuna.distributions import FloatDistribution
+from optuna.distributions import IntDistribution
+
+
+if TYPE_CHECKING:
+    from optuna.distributions import BaseDistribution
 
 
 class _SearchSpaceTransform:
@@ -42,6 +40,9 @@ class _SearchSpaceTransform:
             space by one step. This allows fair sampling for values close to the bounds.
             Should always be :obj:`True` if any parameters are going to be sampled from the
             transformed space.
+        transform_0_1:
+            If :obj:`True`, apply a linear transformation to the bounds and parameters so that
+            they are in the unit cube.
 
     Attributes:
         bounds:
@@ -63,37 +64,37 @@ class _SearchSpaceTransform:
 
     def __init__(
         self,
-        search_space: Dict[str, BaseDistribution],
+        search_space: dict[str, BaseDistribution],
         transform_log: bool = True,
         transform_step: bool = True,
+        transform_0_1: bool = False,
     ) -> None:
-        # TODO(hvy): Avoid casting to `OrderedDict` when Python 3.6 is no longer supported since
-        # order will be guaranteed.
-        search_space = OrderedDict(search_space)
-
         bounds, column_to_encoded_columns, encoded_column_to_column = _transform_search_space(
             search_space, transform_log, transform_step
         )
-
-        self._bounds = bounds
+        self._raw_bounds = bounds
         self._column_to_encoded_columns = column_to_encoded_columns
         self._encoded_column_to_column = encoded_column_to_column
         self._search_space = search_space
         self._transform_log = transform_log
+        self._transform_0_1 = transform_0_1
 
     @property
-    def bounds(self) -> numpy.ndarray:
-        return self._bounds
+    def bounds(self) -> np.ndarray:
+        if self._transform_0_1:
+            return np.array([[0.0, 1.0]] * self._raw_bounds.shape[0])
+        else:
+            return self._raw_bounds
 
     @property
-    def column_to_encoded_columns(self) -> List[numpy.ndarray]:
+    def column_to_encoded_columns(self) -> list[np.ndarray]:
         return self._column_to_encoded_columns
 
     @property
-    def encoded_column_to_column(self) -> numpy.ndarray:
+    def encoded_column_to_column(self) -> np.ndarray:
         return self._encoded_column_to_column
 
-    def transform(self, params: Dict[str, Any]) -> numpy.ndarray:
+    def transform(self, params: dict[str, Any]) -> np.ndarray:
         """Transform a parameter configuration from actual values to continuous space.
 
         Args:
@@ -105,7 +106,7 @@ class _SearchSpaceTransform:
             configuration.
 
         """
-        trans_params = numpy.zeros(self._bounds.shape[0], dtype=numpy.float64)
+        trans_params = np.zeros(self._raw_bounds.shape[0], dtype=np.float64)
 
         bound_idx = 0
         for name, distribution in self._search_space.items():
@@ -113,7 +114,7 @@ class _SearchSpaceTransform:
             param = params[name]
 
             if isinstance(distribution, CategoricalDistribution):
-                choice_idx = distribution.to_internal_repr(param)
+                choice_idx = int(distribution.to_internal_repr(param))
                 trans_params[bound_idx + choice_idx] = 1
                 bound_idx += len(distribution.choices)
             else:
@@ -122,9 +123,16 @@ class _SearchSpaceTransform:
                 )
                 bound_idx += 1
 
+        if self._transform_0_1:
+            single_mask = self._raw_bounds[:, 0] == self._raw_bounds[:, 1]
+            trans_params[single_mask] = 0.5
+            trans_params[~single_mask] = (
+                trans_params[~single_mask] - self._raw_bounds[~single_mask, 0]
+            ) / (self._raw_bounds[~single_mask, 1] - self._raw_bounds[~single_mask, 0])
+
         return trans_params
 
-    def untransform(self, trans_params: numpy.ndarray) -> Dict[str, Any]:
+    def untransform(self, trans_params: np.ndarray) -> dict[str, Any]:
         """Untransform a parameter configuration from continuous space to actual values.
 
         Args:
@@ -137,7 +145,12 @@ class _SearchSpaceTransform:
             Values are untransformed parameter values.
 
         """
-        assert trans_params.shape == (self._bounds.shape[0],)
+        assert trans_params.shape == (self._raw_bounds.shape[0],)
+
+        if self._transform_0_1:
+            trans_params = self._raw_bounds[:, 0] + trans_params * (
+                self._raw_bounds[:, 1] - self._raw_bounds[:, 0]
+            )
 
         params = {}
 
@@ -160,8 +173,8 @@ class _SearchSpaceTransform:
 
 
 def _transform_search_space(
-    search_space: Dict[str, BaseDistribution], transform_log: bool, transform_step: bool
-) -> Tuple[numpy.ndarray, List[numpy.ndarray], numpy.ndarray]:
+    search_space: dict[str, BaseDistribution], transform_log: bool, transform_step: bool
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
     assert len(search_space) > 0, "Cannot transform if no distributions are given."
 
     n_bounds = sum(
@@ -169,9 +182,9 @@ def _transform_search_space(
         for d in search_space.values()
     )
 
-    bounds = numpy.empty((n_bounds, 2), dtype=numpy.float64)
-    column_to_encoded_columns: List[numpy.ndarray] = []
-    encoded_column_to_column = numpy.empty(n_bounds, dtype=numpy.int64)
+    bounds = np.empty((n_bounds, 2), dtype=np.float64)
+    column_to_encoded_columns: list[np.ndarray] = []
+    encoded_column_to_column = np.empty(n_bounds, dtype=np.int64)
 
     bound_idx = 0
     for distribution in search_space.values():
@@ -179,53 +192,46 @@ def _transform_search_space(
         if isinstance(d, CategoricalDistribution):
             n_choices = len(d.choices)
             bounds[bound_idx : bound_idx + n_choices] = (0, 1)  # Broadcast across all choices.
-            encoded_columns = numpy.arange(bound_idx, bound_idx + n_choices)
+            encoded_columns = np.arange(bound_idx, bound_idx + n_choices)
             encoded_column_to_column[encoded_columns] = len(column_to_encoded_columns)
             column_to_encoded_columns.append(encoded_columns)
             bound_idx += n_choices
         elif isinstance(
             d,
             (
-                UniformDistribution,
-                LogUniformDistribution,
-                DiscreteUniformDistribution,
-                IntUniformDistribution,
-                IntLogUniformDistribution,
+                FloatDistribution,
+                IntDistribution,
             ),
         ):
-            if isinstance(d, UniformDistribution):
-                bds = (
-                    _transform_numerical_param(d.low, d, transform_log),
-                    _transform_numerical_param(d.high, d, transform_log),
-                )
-            elif isinstance(d, LogUniformDistribution):
-                bds = (
-                    _transform_numerical_param(d.low, d, transform_log),
-                    _transform_numerical_param(d.high, d, transform_log),
-                )
-            elif isinstance(d, DiscreteUniformDistribution):
-                half_step = 0.5 * d.q if transform_step else 0.0
-                bds = (
-                    _transform_numerical_param(d.low, d, transform_log) - half_step,
-                    _transform_numerical_param(d.high, d, transform_log) + half_step,
-                )
-            elif isinstance(d, IntUniformDistribution):
+            if isinstance(d, FloatDistribution):
+                if d.step is not None:
+                    half_step = 0.5 * d.step if transform_step else 0.0
+                    bds = (
+                        _transform_numerical_param(d.low, d, transform_log) - half_step,
+                        _transform_numerical_param(d.high, d, transform_log) + half_step,
+                    )
+                else:
+                    bds = (
+                        _transform_numerical_param(d.low, d, transform_log),
+                        _transform_numerical_param(d.high, d, transform_log),
+                    )
+            elif isinstance(d, IntDistribution):
                 half_step = 0.5 * d.step if transform_step else 0.0
-                bds = (
-                    _transform_numerical_param(d.low, d, transform_log) - half_step,
-                    _transform_numerical_param(d.high, d, transform_log) + half_step,
-                )
-            elif isinstance(d, IntLogUniformDistribution):
-                half_step = 0.5 if transform_step else 0.0
-                bds = (
-                    _transform_numerical_param(d.low - half_step, d, transform_log),
-                    _transform_numerical_param(d.high + half_step, d, transform_log),
-                )
+                if d.log:
+                    bds = (
+                        _transform_numerical_param(d.low - half_step, d, transform_log),
+                        _transform_numerical_param(d.high + half_step, d, transform_log),
+                    )
+                else:
+                    bds = (
+                        _transform_numerical_param(d.low, d, transform_log) - half_step,
+                        _transform_numerical_param(d.high, d, transform_log) + half_step,
+                    )
             else:
                 assert False, "Should not reach. Unexpected distribution."
 
             bounds[bound_idx] = bds
-            encoded_column = numpy.atleast_1d(bound_idx)
+            encoded_column = np.atleast_1d(bound_idx)
             encoded_column_to_column[encoded_column] = len(column_to_encoded_columns)
             column_to_encoded_columns.append(encoded_column)
             bound_idx += 1
@@ -238,22 +244,22 @@ def _transform_search_space(
 
 
 def _transform_numerical_param(
-    param: Union[int, float], distribution: BaseDistribution, transform_log: bool
+    param: int | float, distribution: BaseDistribution, transform_log: bool
 ) -> float:
     d = distribution
 
     if isinstance(d, CategoricalDistribution):
         assert False, "Should not reach. Should be one-hot encoded."
-    elif isinstance(d, UniformDistribution):
-        trans_param = float(param)
-    elif isinstance(d, LogUniformDistribution):
-        trans_param = math.log(param) if transform_log else float(param)
-    elif isinstance(d, DiscreteUniformDistribution):
-        trans_param = float(param)
-    elif isinstance(d, IntUniformDistribution):
-        trans_param = float(param)
-    elif isinstance(d, IntLogUniformDistribution):
-        trans_param = math.log(param) if transform_log else float(param)
+    elif isinstance(d, FloatDistribution):
+        if d.log:
+            trans_param = math.log(param) if transform_log else float(param)
+        else:
+            trans_param = float(param)
+    elif isinstance(d, IntDistribution):
+        if d.log:
+            trans_param = math.log(param) if transform_log else float(param)
+        else:
+            trans_param = float(param)
     else:
         assert False, "Should not reach. Unexpected distribution."
 
@@ -262,28 +268,38 @@ def _transform_numerical_param(
 
 def _untransform_numerical_param(
     trans_param: float, distribution: BaseDistribution, transform_log: bool
-) -> Union[int, float]:
+) -> int | float:
     d = distribution
 
     if isinstance(d, CategoricalDistribution):
         assert False, "Should not reach. Should be one-hot encoded."
-    elif isinstance(d, UniformDistribution):
-        param = min(trans_param, numpy.nextafter(d.high, d.high - 1))
-    elif isinstance(d, LogUniformDistribution):
-        param = math.exp(trans_param) if transform_log else trans_param
-        param = min(param, numpy.nextafter(d.high, d.high - 1))
-    elif isinstance(d, DiscreteUniformDistribution):
-        # Clip since result may slightly exceed range due to round-off errors.
-        param = float(
-            min(max(numpy.round((trans_param - d.low) / d.q) * d.q + d.low, d.low), d.high)
-        )
-    elif isinstance(d, IntUniformDistribution):
-        param = int(numpy.round((trans_param - d.low) / d.step) * d.step + d.low)
-    elif isinstance(d, IntLogUniformDistribution):
-        if transform_log:
-            param = int(min(max(numpy.round(math.exp(trans_param)), d.low), d.high))
+    elif isinstance(d, FloatDistribution):
+        if d.log:
+            param = math.exp(trans_param) if transform_log else trans_param
+            if d.single():
+                pass
+            else:
+                param = float(np.clip(param, d.low, np.nextafter(d.high, d.high - 1)))
+        elif d.step is not None:
+            param = float(
+                np.clip(np.round((trans_param - d.low) / d.step) * d.step + d.low, d.low, d.high)
+            )
         else:
-            param = int(trans_param)
+            if d.single():
+                param = trans_param
+            else:
+                param = float(min(trans_param, np.nextafter(d.high, d.high - 1)))
+    elif isinstance(d, IntDistribution):
+        if d.log:
+            if transform_log:
+                param = int(round(math.exp(trans_param)))
+                param = min(max(param, d.low), d.high)
+            else:
+                param = int(trans_param)
+        else:
+            step_index = math.floor((trans_param - d.low) / d.step + 0.5)
+            param = step_index * d.step + d.low
+            param = min(max(param, d.low), d.high)
     else:
         assert False, "Should not reach. Unexpected distribution."
 

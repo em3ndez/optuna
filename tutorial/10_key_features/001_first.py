@@ -15,7 +15,6 @@ Usually, Optuna is used to optimize hyperparameters, but as an example,
 let's optimize a simple quadratic function: :math:`(x - 2)^2`.
 """
 
-
 ###################################################################################################
 # First of all, import :mod:`optuna`.
 
@@ -57,8 +56,7 @@ study.optimize(objective, n_trials=100)
 
 best_params = study.best_params
 found_x = best_params["x"]
-print("Found x: {}, (x - 2)^2: {}".format(found_x, (found_x - 2) ** 2))
-
+print(f"Found x: {found_x}, (x - 2)^2: {(found_x - 2) ** 2}")
 ###################################################################################################
 # We can see that the ``x`` value found by Optuna is close to the optimal value of ``2``.
 
@@ -105,7 +103,8 @@ study.best_trial
 # To get all trials:
 
 study.trials
-
+for trial in study.trials[:2]:  # Show first two trials
+    print(trial)
 
 ###################################################################################################
 # To get the number of trials:
@@ -130,4 +129,4 @@ len(study.trials)
 # However, we can check the result again:
 best_params = study.best_params
 found_x = best_params["x"]
-print("Found x: {}, (x - 2)^2: {}".format(found_x, (found_x - 2) ** 2))
+print(f"Found x: {found_x}, (x - 2)^2: {(found_x - 2) ** 2}")

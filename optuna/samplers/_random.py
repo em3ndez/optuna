@@ -1,15 +1,19 @@
-from typing import Any
-from typing import Dict
-from typing import Optional
+from __future__ import annotations
 
-import numpy
+from typing import TYPE_CHECKING
 
-from optuna import distributions
 from optuna._transform import _SearchSpaceTransform
-from optuna.distributions import BaseDistribution
 from optuna.samplers import BaseSampler
-from optuna.study import Study
-from optuna.trial import FrozenTrial
+from optuna.samplers._lazy_random_state import LazyRandomState
+
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from optuna import distributions
+    from optuna.distributions import BaseDistribution
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
 
 
 class RandomSampler(BaseSampler):
@@ -28,7 +32,7 @@ class RandomSampler(BaseSampler):
 
             def objective(trial):
                 x = trial.suggest_float("x", -5, 5)
-                return x ** 2
+                return x**2
 
 
             study = optuna.create_study(sampler=RandomSampler())
@@ -38,24 +42,20 @@ class RandomSampler(BaseSampler):
         seed: Seed for random number generator.
     """
 
-    def __init__(self, seed: Optional[int] = None) -> None:
-
-        self._rng = numpy.random.RandomState(seed)
+    def __init__(self, seed: int | None = None) -> None:
+        self._rng = LazyRandomState(seed)
 
     def reseed_rng(self) -> None:
-
-        self._rng = numpy.random.RandomState()
+        self._rng.rng.seed()
 
     def infer_relative_search_space(
         self, study: Study, trial: FrozenTrial
-    ) -> Dict[str, BaseDistribution]:
-
+    ) -> dict[str, BaseDistribution]:
         return {}
 
     def sample_relative(
-        self, study: Study, trial: FrozenTrial, search_space: Dict[str, BaseDistribution]
-    ) -> Dict[str, Any]:
-
+        self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
+    ) -> dict[str, Any]:
         return {}
 
     def sample_independent(
@@ -65,9 +65,8 @@ class RandomSampler(BaseSampler):
         param_name: str,
         param_distribution: distributions.BaseDistribution,
     ) -> Any:
-
         search_space = {param_name: param_distribution}
         trans = _SearchSpaceTransform(search_space)
-        trans_params = self._rng.uniform(trans.bounds[:, 0], trans.bounds[:, 1])
+        trans_params = self._rng.rng.uniform(trans.bounds[:, 0], trans.bounds[:, 1])
 
         return trans.untransform(trans_params)[param_name]

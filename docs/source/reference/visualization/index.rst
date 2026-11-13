@@ -1,36 +1,95 @@
 .. module:: optuna.visualization
 
+.. module:: optuna.visualization.matplotlib
+
 optuna.visualization
 ====================
 
-The :mod:`~optuna.visualization` module provides utility functions for plotting the optimization process using plotly and matplotlib. Plotting functions generally take a :class:`~optuna.study.Study` object and optional parameters are passed as a list to the ``params`` argument.
+Optuna provides visualization functions with both Plotly and Matplotlib backends.
+Each example page contains tabs for the Plotly and Matplotlib implementations.
+
+.. grid:: 3
+    :gutter: 2
+
+    .. grid-item-card:: plot_contour
+        :link: plot_contour
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.contour_001.png
+
+    .. grid-item-card:: plot_edf
+        :link: plot_edf
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.edf_001.png
+
+    .. grid-item-card:: plot_hypervolume_history
+        :link: plot_hypervolume_history
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.hypervolume_history_001.png
+
+    .. grid-item-card:: plot_intermediate_values
+        :link: plot_intermediate_values
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.intermediate_values_001.png
+
+    .. grid-item-card:: plot_optimization_history
+        :link: plot_optimization_history
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.optimization_history_001.png
+
+    .. grid-item-card:: plot_parallel_coordinate
+        :link: plot_parallel_coordinate
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.parallel_coordinate_001.png
+
+    .. grid-item-card:: plot_param_importances
+        :link: plot_param_importances
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.param_importances_001.png
+
+    .. grid-item-card:: plot_pareto_front
+        :link: plot_pareto_front
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.pareto_front_001.png
+
+    .. grid-item-card:: plot_rank
+        :link: plot_rank
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.rank_001.png
+
+    .. grid-item-card:: plot_slice
+        :link: plot_slice
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.slice_001.png
+
+    .. grid-item-card:: plot_terminator_improvement
+        :link: plot_terminator_improvement
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.terminator_improvement_001.png
+
+    .. grid-item-card:: plot_timeline
+        :link: plot_timeline
+        :link-type: doc
+        :img-top: /reference/visualization/matplotlib/generated/images/sphx_glr_optuna.visualization.matplotlib.timeline_001.png
 
 .. note::
-    In the :mod:`optuna.visualization` module, the following functions use plotly to create figures, but `JupyterLab`_ cannot
-    render them by default. Please follow this `installation guide`_ to show figures in
-    `JupyterLab`_.
-
-    .. _JupyterLab: https://github.com/jupyterlab/jupyterlab
-    .. _installation guide: https://github.com/plotly/plotly.py#jupyterlab-support-python-35
-
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
-   optuna.visualization.plot_contour
-   optuna.visualization.plot_edf
-   optuna.visualization.plot_intermediate_values
-   optuna.visualization.plot_optimization_history
-   optuna.visualization.plot_parallel_coordinate
-   optuna.visualization.plot_param_importances
-   optuna.visualization.plot_pareto_front
-   optuna.visualization.plot_slice
-   optuna.visualization.is_available
-
-.. note::
-    The following :mod:`optuna.visualization.matplotlib` module uses Matplotlib as a backend.
+    The :mod:`optuna.visualization` and :mod:`optuna.visualization.matplotlib` modules
+    provide Plotly and Matplotlib backends, respectively.
 
 .. toctree::
-    :maxdepth: 1
+    :hidden:
 
-    matplotlib
+    plot_contour
+    plot_edf
+    plot_hypervolume_history
+    plot_intermediate_values
+    plot_optimization_history
+    plot_parallel_coordinate
+    plot_param_importances
+    plot_pareto_front
+    plot_rank
+    plot_slice
+    plot_terminator_improvement
+    plot_timeline
+
+.. seealso::
+    The :ref:`visualization` tutorial provides use-cases with examples.

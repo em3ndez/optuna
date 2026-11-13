@@ -1,43 +1,69 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Callable
+from collections.abc import Container
+from collections.abc import Generator
+from collections.abc import Iterable
+from collections.abc import Sequence
 from contextlib import contextmanager
 import copy
 from datetime import datetime
+from datetime import timedelta
 import json
 import logging
 import os
+import random
+import sqlite3
+import time
 from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Generator
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Set
-from typing import Tuple
+from typing import TYPE_CHECKING
 import uuid
 
-import alembic.command
-import alembic.config
-import alembic.migration
-import alembic.script
-from sqlalchemy import func
-from sqlalchemy import orm
-from sqlalchemy.engine import create_engine
-from sqlalchemy.engine import Engine  # NOQA
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.sql import functions
-
 import optuna
+from optuna import _deprecated
 from optuna import distributions
 from optuna import version
-from optuna._study_direction import StudyDirection
-from optuna._study_summary import StudySummary
+from optuna._experimental import warn_experimental_argument
+from optuna._imports import _LazyImport
+from optuna._typing import JSONSerializable
+from optuna._warnings import optuna_warn
 from optuna.storages._base import BaseStorage
 from optuna.storages._base import DEFAULT_STUDY_NAME_PREFIX
-from optuna.storages._rdb import models
+from optuna.storages._heartbeat import BaseHeartbeat
+from optuna.study._frozen import FrozenStudy
+from optuna.study._study_direction import StudyDirection
 from optuna.trial import FrozenTrial
 from optuna.trial import TrialState
+
+
+if TYPE_CHECKING:
+    import alembic.command as alembic_command
+    import alembic.config as alembic_config
+    import alembic.migration as alembic_migration
+    import alembic.script as alembic_script
+    import sqlalchemy
+    import sqlalchemy.dialects.mysql as sqlalchemy_dialects_mysql
+    import sqlalchemy.dialects.postgresql as sqlalchemy_dialects_postgresql
+    import sqlalchemy.dialects.sqlite as sqlalchemy_dialects_sqlite
+    import sqlalchemy.exc as sqlalchemy_exc
+    import sqlalchemy.orm as sqlalchemy_orm
+
+    from optuna.storages._rdb import models
+else:
+    alembic_command = _LazyImport("alembic.command")
+    alembic_config = _LazyImport("alembic.config")
+    alembic_migration = _LazyImport("alembic.migration")
+    alembic_script = _LazyImport("alembic.script")
+
+    sqlalchemy = _LazyImport("sqlalchemy")
+    sqlalchemy_dialects_mysql = _LazyImport("sqlalchemy.dialects.mysql")
+    sqlalchemy_dialects_postgresql = _LazyImport("sqlalchemy.dialects.postgresql")
+    sqlalchemy_dialects_sqlite = _LazyImport("sqlalchemy.dialects.sqlite")
+    sqlalchemy_exc = _LazyImport("sqlalchemy.exc")
+    sqlalchemy_orm = _LazyImport("sqlalchemy.orm")
+
+    models = _LazyImport("optuna.storages._rdb.models")
 
 
 _logger = optuna.logging.get_logger(__name__)
@@ -45,23 +71,24 @@ _logger = optuna.logging.get_logger(__name__)
 
 @contextmanager
 def _create_scoped_session(
-    scoped_session: orm.scoped_session,
+    scoped_session: "sqlalchemy_orm.scoped_session",
     ignore_integrity_error: bool = False,
-) -> Generator[orm.Session, None, None]:
+) -> Generator["sqlalchemy_orm.Session", None, None]:
     session = scoped_session()
     try:
         yield session
         session.commit()
-    except IntegrityError as e:
+    except sqlalchemy_exc.IntegrityError as e:
         session.rollback()
         if ignore_integrity_error:
             _logger.debug(
-                "Ignoring {}. This happens due to a timing issue among threads/processes/nodes. "
-                "Another one might have committed a record with the same key(s).".format(repr(e))
+                f"Ignoring {e!r}. This happens due to a timing issue "
+                "among threads/processes/nodes. "
+                "Another one might have committed a record with the same key(s)."
             )
         else:
             raise
-    except SQLAlchemyError as e:
+    except sqlalchemy_exc.SQLAlchemyError as e:
         session.rollback()
         message = (
             "An exception is raised during the commit. "
@@ -76,7 +103,7 @@ def _create_scoped_session(
         session.close()
 
 
-class RDBStorage(BaseStorage):
+class RDBStorage(BaseStorage, BaseHeartbeat):
     """Storage class for RDB backend.
 
     Note that library users can instantiate this class, but the attributes
@@ -94,7 +121,7 @@ class RDBStorage(BaseStorage):
 
             def objective(trial):
                 x = trial.suggest_float("x", -100, 100)
-                return x ** 2
+                return x**2
 
 
             storage = optuna.storages.RDBStorage(
@@ -106,25 +133,43 @@ class RDBStorage(BaseStorage):
             study.optimize(objective, n_trials=10)
 
     Args:
-        url: URL of the storage.
+        url:
+            URL of the storage.
         engine_kwargs:
             A dictionary of keyword arguments that is passed to
             `sqlalchemy.engine.create_engine`_ function.
         skip_compatibility_check:
-            Flag to skip schema compatibility check if set to True.
+            Flag to skip schema compatibility check if set to :obj:`True`.
         heartbeat_interval:
             Interval to record the heartbeat. It is recorded every ``interval`` seconds.
+            ``heartbeat_interval`` must be :obj:`None` or a positive integer.
+
+            .. note::
+                Heartbeat mechanism is experimental. API would change in the future.
+
+            .. note::
+                The heartbeat is supposed to be used with :meth:`~optuna.study.Study.optimize`.
+                If you use :meth:`~optuna.study.Study.ask` and
+                :meth:`~optuna.study.Study.tell` instead, it will not work.
+
         grace_period:
             Grace period before a running trial is failed from the last heartbeat.
+            ``grace_period`` must be :obj:`None` or a positive integer.
             If it is :obj:`None`, the grace period will be `2 * heartbeat_interval`.
-        failed_trial_callback:
-            A callback function that is invoked after failing each stale trial.
+        heartbeat_stale_trial_callback:
+            A callback function that is invoked after failing each heartbeat-stale trial.
             The function must accept two parameters with the following types in this order:
-            :class:`~optuna.study.Study` and :class:`~optuna.FrozenTrial`.
+            :class:`~optuna.study.Study` and :class:`~optuna.trial.FrozenTrial`.
 
             .. note::
                 The procedure to fail existing stale trials is called just before asking the
                 study for a new trial.
+        failed_trial_callback:
+            Deprecated in v4.9.0. This argument will be removed in v6.0.0.
+            Use ``heartbeat_stale_trial_callback`` instead.
+
+        skip_table_creation:
+            Flag to skip table creation if set to :obj:`True`.
 
     .. _sqlalchemy.engine.create_engine:
         https://docs.sqlalchemy.org/en/latest/core/engines.html#sqlalchemy.create_engine
@@ -139,110 +184,142 @@ class RDBStorage(BaseStorage):
         https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine.params.
         pool_pre_ping
 
-    Raises:
-        :exc:`ValueError`:
-            If the given `heartbeat_interval` or `grace_period` is not a positive integer.
-        :exc:`RuntimeError`:
-            If the a process that was failed by heartbeat but was actually running.
+    .. note::
+        We would never recommend SQLite3 for parallel optimization.
+        Please see the FAQ :ref:`sqlite_concurrency` for details.
+
+    .. note::
+        Mainly in a cluster environment, running trials are often killed unexpectedly.
+        If you want to detect a failure of trials, please use the heartbeat
+        mechanism. Set ``heartbeat_interval``, ``grace_period``, and
+        ``heartbeat_stale_trial_callback`` appropriately according to your use case.
+        For more details, please refer to the :ref:`tutorial <heartbeat_monitoring>` and
+        `Example page
+        <https://github.com/optuna/optuna-examples/blob/main/pytorch/pytorch_checkpoint.py>`__.
+
+    .. seealso::
+        You can use :class:`~optuna.storages.RetryHeartbeatStaleTrialCallback` to automatically
+        retry heartbeat-stale trials.
+
     """
 
     def __init__(
         self,
         url: str,
-        engine_kwargs: Optional[Dict[str, Any]] = None,
+        engine_kwargs: dict[str, Any] | None = None,
         skip_compatibility_check: bool = False,
         *,
-        heartbeat_interval: Optional[int] = None,
-        grace_period: Optional[int] = None,
-        failed_trial_callback: Optional[Callable[["optuna.Study", FrozenTrial], None]] = None,
+        heartbeat_interval: int | None = None,
+        grace_period: int | None = None,
+        heartbeat_stale_trial_callback: (
+            Callable[["optuna.study.Study", FrozenTrial], None] | None
+        ) = None,
+        failed_trial_callback: Callable[["optuna.study.Study", FrozenTrial], None] | None = None,
+        skip_table_creation: bool = False,
     ) -> None:
-
         self.engine_kwargs = engine_kwargs or {}
         self.url = self._fill_storage_url_template(url)
         self.skip_compatibility_check = skip_compatibility_check
-        if heartbeat_interval is not None and heartbeat_interval <= 0:
-            raise ValueError("The value of `heartbeat_interval` should be a positive integer.")
+        if heartbeat_interval is not None:
+            if heartbeat_interval <= 0:
+                raise ValueError("The value of `heartbeat_interval` should be a positive integer.")
+            else:
+                warn_experimental_argument("heartbeat_interval")
         if grace_period is not None and grace_period <= 0:
             raise ValueError("The value of `grace_period` should be a positive integer.")
+        if heartbeat_stale_trial_callback is not None and failed_trial_callback is not None:
+            raise ValueError(
+                "Specify only one of `heartbeat_stale_trial_callback` and `failed_trial_callback`."
+            )
+        if failed_trial_callback is not None:
+            msg = _deprecated._DEPRECATION_WARNING_TEMPLATE.format(
+                name="`failed_trial_callback`", d_ver="4.9.0", r_ver="6.0.0"
+            )
+            optuna_warn(
+                f"{msg} Use `heartbeat_stale_trial_callback` instead.",
+                FutureWarning,
+            )
         self.heartbeat_interval = heartbeat_interval
         self.grace_period = grace_period
-        self.failed_trial_callback = failed_trial_callback
+        self.heartbeat_stale_trial_callback = (
+            heartbeat_stale_trial_callback or failed_trial_callback
+        )
+        self.failed_trial_callback = self.heartbeat_stale_trial_callback
 
         self._set_default_engine_kwargs_for_mysql(url, self.engine_kwargs)
 
         try:
-            self.engine = create_engine(self.url, **self.engine_kwargs)
+            self.engine = sqlalchemy.engine.create_engine(self.url, **self.engine_kwargs)
         except ImportError as e:
             raise ImportError(
                 "Failed to import DB access module for the specified storage URL. "
                 "Please install appropriate one."
             ) from e
 
-        self.scoped_session = orm.scoped_session(orm.sessionmaker(bind=self.engine))
-        models.BaseModel.metadata.create_all(self.engine)
+        self.scoped_session = sqlalchemy_orm.scoped_session(
+            sqlalchemy_orm.sessionmaker(bind=self.engine)
+        )
+        if not skip_table_creation:
+            models.BaseModel.metadata.create_all(self.engine)
 
         self._version_manager = _VersionManager(self.url, self.engine, self.scoped_session)
         if not skip_compatibility_check:
             self._version_manager.check_table_schema_compatibility()
 
-    def __getstate__(self) -> Dict[Any, Any]:
-
+    def __getstate__(self) -> dict[Any, Any]:
         state = self.__dict__.copy()
         del state["scoped_session"]
         del state["engine"]
         del state["_version_manager"]
         return state
 
-    def __setstate__(self, state: Dict[Any, Any]) -> None:
-
+    def __setstate__(self, state: dict[Any, Any]) -> None:
         self.__dict__.update(state)
         try:
-            self.engine = create_engine(self.url, **self.engine_kwargs)
+            self.engine = sqlalchemy.engine.create_engine(self.url, **self.engine_kwargs)
         except ImportError as e:
             raise ImportError(
                 "Failed to import DB access module for the specified storage URL. "
                 "Please install appropriate one."
             ) from e
 
-        self.scoped_session = orm.scoped_session(orm.sessionmaker(bind=self.engine))
+        self.scoped_session = sqlalchemy_orm.scoped_session(
+            sqlalchemy_orm.sessionmaker(bind=self.engine)
+        )
         models.BaseModel.metadata.create_all(self.engine)
         self._version_manager = _VersionManager(self.url, self.engine, self.scoped_session)
         if not self.skip_compatibility_check:
             self._version_manager.check_table_schema_compatibility()
 
-    def create_new_study(self, study_name: Optional[str] = None) -> int:
-
+    def create_new_study(
+        self, directions: Sequence[StudyDirection], study_name: str | None = None
+    ) -> int:
         try:
             with _create_scoped_session(self.scoped_session) as session:
                 if study_name is None:
                     study_name = self._create_unique_study_name(session)
 
-                direction = models.StudyDirectionModel(
-                    direction=StudyDirection.NOT_SET, objective=0
-                )
-                study = models.StudyModel(study_name=study_name, directions=[direction])
-                session.add(study)
-        except IntegrityError:
-            raise optuna.exceptions.DuplicatedStudyError(
-                "Another study with name '{}' already exists. "
-                "Please specify a different name, or reuse the existing one "
-                "by setting `load_if_exists` (for Python API) or "
-                "`--skip-if-exists` flag (for CLI).".format(study_name)
-            )
+                direction_models = [
+                    models.StudyDirectionModel(objective=objective, direction=d)
+                    for objective, d in enumerate(list(directions))
+                ]
 
-        _logger.info("A new study created in RDB with name: {}".format(study_name))
+                session.add(models.StudyModel(study_name=study_name, directions=direction_models))
+
+        except sqlalchemy_exc.IntegrityError:
+            raise optuna.exceptions.DuplicatedStudyError
+
+        _logger.info(f"A new study created in RDB with name: {study_name}")
 
         return self.get_study_id_from_name(study_name)
 
     def delete_study(self, study_id: int) -> None:
-
         with _create_scoped_session(self.scoped_session, True) as session:
             study = models.StudyModel.find_or_raise_by_id(study_id, session)
             session.delete(study)
 
     @staticmethod
-    def _create_unique_study_name(session: orm.Session) -> str:
-
+    def _create_unique_study_name(session: "sqlalchemy_orm.Session") -> str:
         while True:
             study_uuid = str(uuid.uuid4())
             study_name = DEFAULT_STUDY_NAME_PREFIX + study_uuid
@@ -252,40 +329,7 @@ class RDBStorage(BaseStorage):
 
         return study_name
 
-    # TODO(sano): Prevent simultaneously setting different direction in distributed environments.
-    def set_study_directions(self, study_id: int, directions: Sequence[StudyDirection]) -> None:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            study = models.StudyModel.find_or_raise_by_id(study_id, session)
-            directions = list(directions)
-            current_directions = [
-                d.direction for d in models.StudyDirectionModel.where_study_id(study_id, session)
-            ]
-            if (
-                len(current_directions) > 0
-                and current_directions[0] != StudyDirection.NOT_SET
-                and current_directions != directions
-            ):
-                raise ValueError(
-                    "Cannot overwrite study direction from {} to {}.".format(
-                        current_directions, directions
-                    )
-                )
-
-            for objective, d in enumerate(directions):
-                direction_model = models.StudyDirectionModel.find_by_study_and_objective(
-                    study, objective, session
-                )
-                if direction_model is None:
-                    direction_model = models.StudyDirectionModel(
-                        study_id=study_id, objective=objective, direction=d
-                    )
-                    session.add(direction_model)
-                else:
-                    direction_model.direction = d
-
     def set_study_user_attr(self, study_id: int, key: str, value: Any) -> None:
-
         with _create_scoped_session(self.scoped_session, True) as session:
             study = models.StudyModel.find_or_raise_by_id(study_id, session)
             attribute = models.StudyUserAttributeModel.find_by_study_and_key(study, key, session)
@@ -297,8 +341,7 @@ class RDBStorage(BaseStorage):
             else:
                 attribute.value_json = json.dumps(value)
 
-    def set_study_system_attr(self, study_id: int, key: str, value: Any) -> None:
-
+    def set_study_system_attr(self, study_id: int, key: str, value: JSONSerializable) -> None:
         with _create_scoped_session(self.scoped_session, True) as session:
             study = models.StudyModel.find_or_raise_by_id(study_id, session)
             attribute = models.StudySystemAttributeModel.find_by_study_and_key(study, key, session)
@@ -311,39 +354,27 @@ class RDBStorage(BaseStorage):
                 attribute.value_json = json.dumps(value)
 
     def get_study_id_from_name(self, study_name: str) -> int:
-
         with _create_scoped_session(self.scoped_session) as session:
             study = models.StudyModel.find_or_raise_by_name(study_name, session)
             study_id = study.study_id
 
         return study_id
 
-    def get_study_id_from_trial_id(self, trial_id: int) -> int:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-            study_id = trial.study_id
-
-        return study_id
-
     def get_study_name_from_id(self, study_id: int) -> str:
-
         with _create_scoped_session(self.scoped_session) as session:
             study = models.StudyModel.find_or_raise_by_id(study_id, session)
             study_name = study.study_name
 
         return study_name
 
-    def get_study_directions(self, study_id: int) -> List[StudyDirection]:
-
+    def get_study_directions(self, study_id: int) -> list[StudyDirection]:
         with _create_scoped_session(self.scoped_session) as session:
             study = models.StudyModel.find_or_raise_by_id(study_id, session)
             directions = [d.direction for d in study.directions]
 
         return directions
 
-    def get_study_user_attrs(self, study_id: int) -> Dict[str, Any]:
-
+    def get_study_user_attrs(self, study_id: int) -> dict[str, Any]:
         with _create_scoped_session(self.scoped_session) as session:
             # Ensure that that study exists.
             models.StudyModel.find_or_raise_by_id(study_id, session)
@@ -352,8 +383,7 @@ class RDBStorage(BaseStorage):
 
         return user_attrs
 
-    def get_study_system_attrs(self, study_id: int) -> Dict[str, Any]:
-
+    def get_study_system_attrs(self, study_id: int) -> dict[str, Any]:
         with _create_scoped_session(self.scoped_session) as session:
             # Ensure that that study exists.
             models.StudyModel.find_or_raise_by_id(study_id, session)
@@ -362,8 +392,7 @@ class RDBStorage(BaseStorage):
 
         return system_attrs
 
-    def get_trial_user_attrs(self, trial_id: int) -> Dict[str, Any]:
-
+    def get_trial_user_attrs(self, trial_id: int) -> dict[str, Any]:
         with _create_scoped_session(self.scoped_session) as session:
             # Ensure trial exists.
             models.TrialModel.find_or_raise_by_id(trial_id, session)
@@ -373,8 +402,7 @@ class RDBStorage(BaseStorage):
 
         return user_attrs
 
-    def get_trial_system_attrs(self, trial_id: int) -> Dict[str, Any]:
-
+    def get_trial_system_attrs(self, trial_id: int) -> dict[str, Any]:
         with _create_scoped_session(self.scoped_session) as session:
             # Ensure trial exists.
             models.TrialModel.find_or_raise_by_id(trial_id, session)
@@ -384,119 +412,54 @@ class RDBStorage(BaseStorage):
 
         return system_attrs
 
-    def get_all_study_summaries(self) -> List[StudySummary]:
-
+    def get_all_studies(self) -> list[FrozenStudy]:
         with _create_scoped_session(self.scoped_session) as session:
-            summarized_trial = (
+            studies = (
                 session.query(
-                    models.TrialModel.study_id,
-                    functions.min(models.TrialModel.datetime_start).label("datetime_start"),
-                    functions.count(models.TrialModel.trial_id).label("n_trial"),
+                    models.StudyModel.study_id,
+                    models.StudyModel.study_name,
                 )
-                .group_by(models.TrialModel.study_id)
-                .with_labels()
-                .subquery()
+                .order_by(models.StudyModel.study_id)
+                .all()
             )
-            study_summary_stmt = session.query(
-                models.StudyModel.study_id,
-                models.StudyModel.study_name,
-                summarized_trial.c.datetime_start,
-                functions.coalesce(summarized_trial.c.n_trial, 0).label("n_trial"),
-            ).select_from(orm.outerjoin(models.StudyModel, summarized_trial))
 
-            study_summary = study_summary_stmt.all()
-            study_summaries = []
-            for study in study_summary:
-                directions = [
-                    d.direction
-                    for d in models.StudyDirectionModel.where_study_id(study.study_id, session)
-                ]
-                best_trial: Optional[models.TrialModel] = None
-                try:
-                    if len(directions) > 1:
-                        raise ValueError
-                    elif directions[0] == StudyDirection.MAXIMIZE:
-                        best_trial = models.TrialModel.find_max_value_trial(
-                            study.study_id, 0, session
-                        )
-                    else:
-                        best_trial = models.TrialModel.find_min_value_trial(
-                            study.study_id, 0, session
-                        )
-                except ValueError:
-                    best_trial_frozen: Optional[FrozenTrial] = None
-                if best_trial:
-                    value = models.TrialValueModel.find_by_trial_and_objective(
-                        best_trial, 0, session
-                    )
-                    assert value
-                    params = (
-                        session.query(
-                            models.TrialParamModel.param_name,
-                            models.TrialParamModel.param_value,
-                            models.TrialParamModel.distribution_json,
-                        )
-                        .filter(models.TrialParamModel.trial_id == best_trial.trial_id)
-                        .all()
-                    )
-                    param_dict = {}
-                    param_distributions = {}
-                    for param in params:
-                        distribution = distributions.json_to_distribution(param.distribution_json)
-                        param_dict[param.param_name] = distribution.to_external_repr(
-                            param.param_value
-                        )
-                        param_distributions[param.param_name] = distribution
-                    user_attrs = models.TrialUserAttributeModel.where_trial_id(
-                        best_trial.trial_id, session
-                    )
-                    system_attrs = models.TrialSystemAttributeModel.where_trial_id(
-                        best_trial.trial_id, session
-                    )
-                    intermediate = models.TrialIntermediateValueModel.where_trial_id(
-                        best_trial.trial_id, session
-                    )
-                    best_trial_frozen = FrozenTrial(
-                        best_trial.number,
-                        TrialState.COMPLETE,
-                        value.value,
-                        best_trial.datetime_start,
-                        best_trial.datetime_complete,
-                        param_dict,
-                        param_distributions,
-                        {i.key: json.loads(i.value_json) for i in user_attrs},
-                        {i.key: json.loads(i.value_json) for i in system_attrs},
-                        {value.step: value.intermediate_value for value in intermediate},
-                        best_trial.trial_id,
-                    )
-                user_attrs = models.StudyUserAttributeModel.where_study_id(study.study_id, session)
-                system_attrs = models.StudySystemAttributeModel.where_study_id(
-                    study.study_id, session
-                )
-                study_summaries.append(
-                    StudySummary(
+            _directions = defaultdict(list)
+            for direction_model in session.query(models.StudyDirectionModel).all():
+                _directions[direction_model.study_id].append(direction_model.direction)
+
+            _user_attrs = defaultdict(list)
+            for attribute_model in session.query(models.StudyUserAttributeModel).all():
+                _user_attrs[attribute_model.study_id].append(attribute_model)
+
+            _system_attrs = defaultdict(list)
+            for attribute_model in session.query(models.StudySystemAttributeModel).all():
+                _system_attrs[attribute_model.study_id].append(attribute_model)
+
+            frozen_studies = []
+            for study in studies:
+                directions = _directions[study.study_id]
+                user_attrs = _user_attrs.get(study.study_id, [])
+                system_attrs = _system_attrs.get(study.study_id, [])
+                frozen_studies.append(
+                    FrozenStudy(
                         study_name=study.study_name,
                         direction=None,
                         directions=directions,
-                        best_trial=best_trial_frozen,
                         user_attrs={i.key: json.loads(i.value_json) for i in user_attrs},
                         system_attrs={i.key: json.loads(i.value_json) for i in system_attrs},
-                        n_trials=study.n_trial,
-                        datetime_start=study.datetime_start,
                         study_id=study.study_id,
                     )
                 )
 
-        return study_summaries
+            return frozen_studies
 
-    def create_new_trial(self, study_id: int, template_trial: Optional[FrozenTrial] = None) -> int:
-
+    def create_new_trial(self, study_id: int, template_trial: FrozenTrial | None = None) -> int:
         return self._create_new_trial(study_id, template_trial)._trial_id
 
     def _create_new_trial(
-        self, study_id: int, template_trial: Optional[FrozenTrial] = None
+        self, study_id: int, template_trial: FrozenTrial | None = None
     ) -> FrozenTrial:
-        """Create a new trial and returns its trial_id and a :class:`~optuna.trial.FrozenTrial`.
+        """Create a new trial and returns a :class:`~optuna.trial.FrozenTrial`.
 
         Args:
             study_id:
@@ -509,52 +472,60 @@ class RDBStorage(BaseStorage):
 
         """
 
-        # Retry a couple of times. Deadlocks may occur in distributed environments.
-        n_retries = 0
-        with _create_scoped_session(self.scoped_session) as session:
-            while True:
-                try:
-                    # Ensure that that study exists.
-                    #
-                    # Locking within a study is necessary since the creation of a trial is not an
-                    # atomic operation. More precisely, the trial number computed in
-                    # `_get_prepared_new_trial` is prone to race conditions without this lock.
-                    models.StudyModel.find_or_raise_by_id(study_id, session, for_update=True)
-
-                    trial = self._get_prepared_new_trial(study_id, template_trial, session)
-                    break  # Successfully created trial.
-                except OperationalError:
-                    if n_retries > 2:
-                        raise
-
-            n_retries += 1
-
+        def _create_frozen_trial(
+            trial: "models.TrialModel", template_trial: FrozenTrial | None
+        ) -> FrozenTrial:
             if template_trial:
                 frozen = copy.deepcopy(template_trial)
                 frozen.number = trial.number
                 frozen.datetime_start = trial.datetime_start
                 frozen._trial_id = trial.trial_id
-            else:
-                frozen = FrozenTrial(
-                    number=trial.number,
-                    state=trial.state,
-                    value=None,
-                    values=None,
-                    datetime_start=trial.datetime_start,
-                    datetime_complete=None,
-                    params={},
-                    distributions={},
-                    user_attrs={},
-                    system_attrs={},
-                    intermediate_values={},
-                    trial_id=trial.trial_id,
-                )
+                return frozen
+            return FrozenTrial(
+                number=trial.number,
+                state=trial.state,
+                value=None,
+                values=None,
+                datetime_start=trial.datetime_start,
+                datetime_complete=None,
+                params={},
+                distributions={},
+                user_attrs={},
+                system_attrs={},
+                intermediate_values={},
+                trial_id=trial.trial_id,
+            )
 
-            return frozen
+        # Retry maximum five times. Deadlocks may occur in distributed environments.
+        MAX_RETRIES = 5
+        for n_retries in range(1, MAX_RETRIES + 1):
+            try:
+                with _create_scoped_session(self.scoped_session) as session:
+                    # This lock is necessary because the trial creation is not an atomic operation
+                    # and the calculation of trial.number is prone to race conditions.
+                    models.StudyModel.find_or_raise_by_id(study_id, session, for_update=True)
+                    trial = self._get_prepared_new_trial(study_id, template_trial, session)
+                    return _create_frozen_trial(trial, template_trial)
+            # sqlalchemy_exc.OperationalError is converted to ``StorageInternalError``.
+            except optuna.exceptions.StorageInternalError as e:
+                # ``OperationalError`` happens either by (1) invalid inputs, e.g., too long string,
+                # or (2) timeout error, which relates to deadlock. Although Error (1) is not
+                # intended to be caught here, it must be fixed to use RDBStorage anyways.
+                if n_retries == MAX_RETRIES:
+                    raise e
+
+                # Optuna defers to the DB administrator to reduce DB server congestion, hence
+                # Optuna simply uses non-exponential backoff here for retries caused by deadlock.
+                time.sleep(random.random() * 2.0)
+
+        assert False, "Should not be reached."
 
     def _get_prepared_new_trial(
-        self, study_id: int, template_trial: Optional[FrozenTrial], session: orm.Session
-    ) -> models.TrialModel:
+        self,
+        study_id: int,
+        template_trial: FrozenTrial | None,
+        session: "sqlalchemy_orm.Session",
+    ) -> "models.TrialModel":
         if template_trial is None:
             trial = models.TrialModel(
                 study_id=study_id,
@@ -589,11 +560,9 @@ class RDBStorage(BaseStorage):
         if template_trial is not None:
             if template_trial.values is not None and len(template_trial.values) > 1:
                 for objective, value in enumerate(template_trial.values):
-                    self._set_trial_value_without_commit(session, trial.trial_id, objective, value)
+                    self._set_trial_value_without_commit(session, trial, objective, value)
             elif template_trial.value is not None:
-                self._set_trial_value_without_commit(
-                    session, trial.trial_id, 0, template_trial.value
-                )
+                self._set_trial_value_without_commit(session, trial, 0, template_trial.value)
 
             for param_name, param_value in template_trial.params.items():
                 distribution = template_trial.distributions[param_name]
@@ -603,10 +572,14 @@ class RDBStorage(BaseStorage):
                 )
 
             for key, value in template_trial.user_attrs.items():
-                self._set_trial_user_attr_without_commit(session, trial.trial_id, key, value)
+                self._set_trial_attr_without_commit(
+                    session, models.TrialUserAttributeModel, trial.trial_id, key, value
+                )
 
             for key, value in template_trial.system_attrs.items():
-                self._set_trial_system_attr_without_commit(session, trial.trial_id, key, value)
+                self._set_trial_attr_without_commit(
+                    session, models.TrialSystemAttributeModel, trial.trial_id, key, value
+                )
 
             for step, intermediate_value in template_trial.intermediate_values.items():
                 self._set_trial_intermediate_value_without_commit(
@@ -620,160 +593,91 @@ class RDBStorage(BaseStorage):
 
         return trial
 
-    def _update_trial(
+    def set_trial_param(
         self,
         trial_id: int,
-        state: Optional[TrialState] = None,
-        values: Optional[Sequence[float]] = None,
-        intermediate_values: Optional[Dict[int, float]] = None,
-        params: Optional[Dict[str, Any]] = None,
-        distributions_: Optional[Dict[str, distributions.BaseDistribution]] = None,
-        user_attrs: Optional[Dict[str, Any]] = None,
-        system_attrs: Optional[Dict[str, Any]] = None,
-        datetime_start: Optional[datetime] = None,
-        datetime_complete: Optional[datetime] = None,
-    ) -> bool:
-        """Sync latest trial updates to a database.
+        param_name: str,
+        param_value_internal: float,
+        distribution: distributions.BaseDistribution,
+    ) -> None:
+        self._set_trial_param(trial_id, param_name, param_value_internal, distribution, None)
 
-        Args:
-            trial_id:
-                Trial id of the trial to update.
-            state:
-                New state. None when there are no changes.
-            values:
-                New value. None when there are no changes.
-            intermediate_values:
-                New intermediate values. None when there are no updates.
-            params:
-                New parameter dictionary. None when there are no updates.
-            distributions_:
-                New parameter distributions. None when there are no updates.
-            user_attrs:
-                New user_attr. None when there are no updates.
-            system_attrs:
-                New system_attr. None when there are no updates.
-            datetime_start:
-                Start time of the trial. Set when this method change the state
-                of trial into running state.
-            datetime_complete:
-                Completion time of the trial. Set if and only if this method
-                change the state of trial into one of the finished states.
+    def _set_trial_param(
+        self,
+        trial_id: int,
+        param_name: str,
+        param_value_internal: float,
+        distribution: distributions.BaseDistribution,
+        previous_distribution: distributions.BaseDistribution | None,
+    ) -> None:
+        with _create_scoped_session(self.scoped_session, True) as session:
+            self._set_trial_param_without_commit(
+                session,
+                trial_id,
+                param_name,
+                param_value_internal,
+                distribution,
+                previous_distribution,
+            )
 
-        Returns:
-            True when success.
+    def _set_trial_param_without_commit(
+        self,
+        session: "sqlalchemy_orm.Session",
+        trial_id: int,
+        param_name: str,
+        param_value_internal: float,
+        distribution: distributions.BaseDistribution,
+        previous_distribution: distributions.BaseDistribution | None = None,
+    ) -> None:
+        trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
+        self.check_trial_is_updatable(trial_id, trial.state)
 
-        """
+        if previous_distribution is None:
+            previous_record = (
+                session.query(models.TrialParamModel)
+                .join(models.TrialModel)
+                .filter(models.TrialModel.study_id == trial.study_id)
+                .filter(models.TrialParamModel.param_name == param_name)
+                .first()
+            )
+            if previous_record is not None:
+                previous_distribution = distributions.json_to_distribution(
+                    previous_record.distribution_json
+                )
 
+        if previous_distribution is not None:
+            distributions.check_distribution_compatibility(previous_distribution, distribution)
+
+        trial_param = models.TrialParamModel(
+            trial_id=trial_id,
+            param_name=param_name,
+            param_value=param_value_internal,
+            distribution_json=distributions.distribution_to_json(distribution),
+        )
+
+        session.add(trial_param)
+
+    def get_trial_param(self, trial_id: int, param_name: str) -> float:
         with _create_scoped_session(self.scoped_session) as session:
-            trial_model = models.TrialModel.find_or_raise_by_id(trial_id, session)
-            if trial_model.state.is_finished():
-                raise RuntimeError("Cannot change attributes of finished trial.")
-            if (
-                state
-                and trial_model.state != state
-                and state == TrialState.RUNNING
-                and trial_model.state != TrialState.WAITING
-            ):
-                return False
+            trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
+            trial_param = models.TrialParamModel.find_or_raise_by_trial_and_param_name(
+                trial, param_name, session
+            )
+            param_value = trial_param.param_value
 
-            if state:
-                trial_model.state = state
+        return param_value
 
-            if datetime_start:
-                trial_model.datetime_start = datetime_start
-
-            if datetime_complete:
-                trial_model.datetime_complete = datetime_complete
-
-            if values is not None:
-                trial_values = models.TrialValueModel.where_trial_id(trial_id, session)
-                if len(trial_values) > 0:
-                    for objective in range(len(values)):
-                        trial_values[objective].value = values[objective]
-                        session.add(trial_values[objective])
-                else:
-                    for objective in range(len(values)):
-                        trial_model.values.extend(
-                            [models.TrialValueModel(objective=objective, value=values[objective])]
-                        )
-
-            if user_attrs:
-                trial_user_attrs = models.TrialUserAttributeModel.where_trial_id(trial_id, session)
-                trial_user_attrs_dict = {attr.key: attr for attr in trial_user_attrs}
-                for k, v in user_attrs.items():
-                    if k in trial_user_attrs_dict:
-                        trial_user_attrs_dict[k].value_json = json.dumps(v)
-                        session.add(trial_user_attrs_dict[k])
-                trial_model.user_attributes.extend(
-                    models.TrialUserAttributeModel(key=k, value_json=json.dumps(v))
-                    for k, v in user_attrs.items()
-                    if k not in trial_user_attrs_dict
-                )
-
-            if system_attrs:
-                trial_system_attrs = models.TrialSystemAttributeModel.where_trial_id(
-                    trial_id, session
-                )
-                trial_system_attrs_dict = {attr.key: attr for attr in trial_system_attrs}
-                for k, v in system_attrs.items():
-                    if k in trial_system_attrs_dict:
-                        trial_system_attrs_dict[k].value_json = json.dumps(v)
-                        session.add(trial_system_attrs_dict[k])
-                trial_model.system_attributes.extend(
-                    models.TrialSystemAttributeModel(key=k, value_json=json.dumps(v))
-                    for k, v in system_attrs.items()
-                    if k not in trial_system_attrs_dict
-                )
-
-            if intermediate_values:
-                trial_intermediate_values = models.TrialIntermediateValueModel.where_trial_id(
-                    trial_id, session
-                )
-                intermediate_values_dict = {v.step: v for v in trial_intermediate_values}
-                for s, v in intermediate_values.items():
-                    if s in intermediate_values_dict:
-                        intermediate_values_dict[s].intermediate_value = v
-                        session.add(intermediate_values_dict[s])
-                trial_model.intermediate_values.extend(
-                    models.TrialIntermediateValueModel(step=s, intermediate_value=v)
-                    for s, v in intermediate_values.items()
-                    if s not in intermediate_values_dict
-                )
-
-            if params and distributions_:
-                trial_param = models.TrialParamModel.where_trial_id(trial_id, session)
-                trial_param_dict = {attr.param_name: attr for attr in trial_param}
-                for name, v in params.items():
-                    if name in trial_param_dict:
-                        trial_param_dict[
-                            name
-                        ].distribution_json = distributions.distribution_to_json(
-                            distributions_[name]
-                        )
-                        trial_param_dict[name].param_value = v
-                        session.add(trial_param_dict[name])
-                trial_model.params.extend(
-                    models.TrialParamModel(
-                        param_name=param_name,
-                        param_value=param_value,
-                        distribution_json=distributions.distribution_to_json(
-                            distributions_[param_name]
-                        ),
-                    )
-                    for param_name, param_value in params.items()
-                    if param_name not in trial_param_dict
-                )
-
-            session.add(trial_model)
-
-        return True
-
-    def set_trial_state(self, trial_id: int, state: TrialState) -> bool:
-
+    def set_trial_state_values(
+        self, trial_id: int, state: TrialState, values: Sequence[float] | None = None
+    ) -> bool:
         try:
             with _create_scoped_session(self.scoped_session) as session:
                 trial = models.TrialModel.find_or_raise_by_id(trial_id, session, for_update=True)
                 self.check_trial_is_updatable(trial_id, trial.state)
+
+                if values is not None:
+                    for objective, v in enumerate(values):
+                        self._set_trial_value_without_commit(session, trial, objective, v)
 
                 if state == TrialState.RUNNING and trial.state != TrialState.WAITING:
                     return False
@@ -785,185 +689,139 @@ class RDBStorage(BaseStorage):
 
                 if state.is_finished():
                     trial.datetime_complete = datetime.now()
-        except IntegrityError:
+        except sqlalchemy_exc.IntegrityError:
             return False
         return True
 
-    def set_trial_param(
-        self,
-        trial_id: int,
-        param_name: str,
-        param_value_internal: float,
-        distribution: distributions.BaseDistribution,
-    ) -> None:
-
-        with _create_scoped_session(self.scoped_session, True) as session:
-            self._set_trial_param_without_commit(
-                session, trial_id, param_name, param_value_internal, distribution
-            )
-
-    def _set_trial_param_without_commit(
-        self,
-        session: orm.Session,
-        trial_id: int,
-        param_name: str,
-        param_value_internal: float,
-        distribution: distributions.BaseDistribution,
-    ) -> None:
-
-        trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-        self.check_trial_is_updatable(trial_id, trial.state)
-
-        trial_param = models.TrialParamModel.find_by_trial_and_param_name(
-            trial, param_name, session
-        )
-
-        if trial_param is not None:
-            # Raise error in case distribution is incompatible.
-            distributions.check_distribution_compatibility(
-                distributions.json_to_distribution(trial_param.distribution_json), distribution
-            )
-
-            trial_param.param_value = param_value_internal
-            trial_param.distribution_json = distributions.distribution_to_json(distribution)
-        else:
-            trial_param = models.TrialParamModel(
-                trial_id=trial_id,
-                param_name=param_name,
-                param_value=param_value_internal,
-                distribution_json=distributions.distribution_to_json(distribution),
-            )
-
-            trial_param.check_and_add(session)
-
-    def _check_and_set_param_distribution(
-        self,
-        study_id: int,
-        trial_id: int,
-        param_name: str,
-        param_value_internal: float,
-        distribution: distributions.BaseDistribution,
-    ) -> None:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            # Acquire lock.
-            #
-            # Assume that study exists.
-            models.StudyModel.find_or_raise_by_id(study_id, session, for_update=True)
-
-            models.TrialParamModel(
-                trial_id=trial_id,
-                param_name=param_name,
-                param_value=param_value_internal,
-                distribution_json=distributions.distribution_to_json(distribution),
-            ).check_and_add(session)
-
-    def get_trial_param(self, trial_id: int, param_name: str) -> float:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-            trial_param = models.TrialParamModel.find_or_raise_by_trial_and_param_name(
-                trial, param_name, session
-            )
-            param_value = trial_param.param_value
-
-        return param_value
-
-    def set_trial_values(self, trial_id: int, values: Sequence[float]) -> None:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-            self.check_trial_is_updatable(trial_id, trial.state)
-            for objective, v in enumerate(values):
-                self._set_trial_value_without_commit(session, trial_id, objective, v)
-
     def _set_trial_value_without_commit(
-        self, session: orm.Session, trial_id: int, objective: int, value: float
+        self,
+        session: "sqlalchemy_orm.Session",
+        trial: models.TrialModel,
+        objective: int,
+        value: float,
     ) -> None:
-
-        trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-        self.check_trial_is_updatable(trial_id, trial.state)
+        self.check_trial_is_updatable(trial.trial_id, trial.state)
+        stored_value, value_type = models.TrialValueModel.value_to_stored_repr(value)
 
         trial_value = models.TrialValueModel.find_by_trial_and_objective(trial, objective, session)
         if trial_value is None:
             trial_value = models.TrialValueModel(
-                trial_id=trial_id, objective=objective, value=value
+                trial_id=trial.trial_id,
+                objective=objective,
+                value=stored_value,
+                value_type=value_type,
             )
             session.add(trial_value)
         else:
-            trial_value.value = value
+            trial_value.value = stored_value
+            trial_value.value_type = value_type
 
     def set_trial_intermediate_value(
         self, trial_id: int, step: int, intermediate_value: float
     ) -> None:
-
         with _create_scoped_session(self.scoped_session, True) as session:
             self._set_trial_intermediate_value_without_commit(
                 session, trial_id, step, intermediate_value
             )
 
     def _set_trial_intermediate_value_without_commit(
-        self, session: orm.Session, trial_id: int, step: int, intermediate_value: float
+        self,
+        session: "sqlalchemy_orm.Session",
+        trial_id: int,
+        step: int,
+        intermediate_value: float,
     ) -> None:
-
         trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
         self.check_trial_is_updatable(trial_id, trial.state)
 
+        (
+            stored_value,
+            value_type,
+        ) = models.TrialIntermediateValueModel.intermediate_value_to_stored_repr(
+            intermediate_value
+        )
         trial_intermediate_value = models.TrialIntermediateValueModel.find_by_trial_and_step(
             trial, step, session
         )
         if trial_intermediate_value is None:
             trial_intermediate_value = models.TrialIntermediateValueModel(
-                trial_id=trial_id, step=step, intermediate_value=intermediate_value
+                trial_id=trial_id,
+                step=step,
+                intermediate_value=stored_value,
+                intermediate_value_type=value_type,
             )
             session.add(trial_intermediate_value)
         else:
-            trial_intermediate_value.intermediate_value = intermediate_value
+            trial_intermediate_value.intermediate_value = stored_value
+            trial_intermediate_value.intermediate_value_type = value_type
 
     def set_trial_user_attr(self, trial_id: int, key: str, value: Any) -> None:
-
         with _create_scoped_session(self.scoped_session, True) as session:
-            self._set_trial_user_attr_without_commit(session, trial_id, key, value)
+            self._set_trial_attr_without_commit(
+                session,
+                models.TrialUserAttributeModel,
+                trial_id,
+                key,
+                value,
+            )
 
-    def _set_trial_user_attr_without_commit(
-        self, session: orm.Session, trial_id: int, key: str, value: Any
+    def set_trial_system_attr(self, trial_id: int, key: str, value: JSONSerializable) -> None:
+        with _create_scoped_session(self.scoped_session, True) as session:
+            self._set_trial_attr_without_commit(
+                session,
+                models.TrialSystemAttributeModel,
+                trial_id,
+                key,
+                value,
+            )
+
+    def _set_trial_attr_without_commit(
+        self,
+        session: "sqlalchemy_orm.Session",
+        model_cls: type[models.TrialUserAttributeModel | models.TrialSystemAttributeModel],
+        trial_id: int,
+        key: str,
+        value: Any,
     ) -> None:
-
         trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
         self.check_trial_is_updatable(trial_id, trial.state)
 
-        attribute = models.TrialUserAttributeModel.find_by_trial_and_key(trial, key, session)
-        if attribute is None:
-            attribute = models.TrialUserAttributeModel(
+        if self.engine.name == "mysql":
+            mysql_insert_stmt = sqlalchemy_dialects_mysql.insert(model_cls).values(
                 trial_id=trial_id, key=key, value_json=json.dumps(value)
             )
-            session.add(attribute)
-        else:
-            attribute.value_json = json.dumps(value)
-
-    def set_trial_system_attr(self, trial_id: int, key: str, value: Any) -> None:
-
-        with _create_scoped_session(self.scoped_session, True) as session:
-            self._set_trial_system_attr_without_commit(session, trial_id, key, value)
-
-    def _set_trial_system_attr_without_commit(
-        self, session: orm.Session, trial_id: int, key: str, value: Any
-    ) -> None:
-
-        trial = models.TrialModel.find_or_raise_by_id(trial_id, session)
-        self.check_trial_is_updatable(trial_id, trial.state)
-
-        attribute = models.TrialSystemAttributeModel.find_by_trial_and_key(trial, key, session)
-        if attribute is None:
-            attribute = models.TrialSystemAttributeModel(
+            mysql_upsert_stmt = mysql_insert_stmt.on_duplicate_key_update(
+                value_json=mysql_insert_stmt.inserted.value_json
+            )
+            session.execute(mysql_upsert_stmt)
+        elif self.engine.name == "sqlite" and sqlite3.sqlite_version_info >= (3, 24, 0):
+            sqlite_insert_stmt = sqlalchemy_dialects_sqlite.insert(model_cls).values(
                 trial_id=trial_id, key=key, value_json=json.dumps(value)
             )
-            session.add(attribute)
+            sqlite_upsert_stmt = sqlite_insert_stmt.on_conflict_do_update(
+                index_elements=[model_cls.trial_id, model_cls.key],
+                set_=dict(value_json=sqlite_insert_stmt.excluded.value_json),
+            )
+            session.execute(sqlite_upsert_stmt)
+        elif self.engine.name == "postgresql":
+            pg_insert_stmt = sqlalchemy_dialects_postgresql.insert(model_cls).values(
+                trial_id=trial_id, key=key, value_json=json.dumps(value)
+            )
+            pg_upsert_stmt = pg_insert_stmt.on_conflict_do_update(
+                index_elements=[model_cls.trial_id, model_cls.key],
+                set_=dict(value_json=pg_insert_stmt.excluded.value_json),
+            )
+            session.execute(pg_upsert_stmt)
         else:
-            attribute.value_json = json.dumps(value)
+            # TODO(porink0424): Add support for other databases.
+            attribute = model_cls.find_by_trial_and_key(trial, key, session)
+            if attribute is None:
+                attribute = model_cls(trial_id=trial_id, key=key, value_json=json.dumps(value))
+                session.add(attribute)
+            else:
+                attribute.value_json = json.dumps(value)
 
     def get_trial_id_from_study_id_trial_number(self, study_id: int, trial_number: int) -> int:
-
         with _create_scoped_session(self.scoped_session) as session:
             trial_id = (
                 session.query(models.TrialModel.trial_id)
@@ -975,19 +833,12 @@ class RDBStorage(BaseStorage):
             )
             if trial_id is None:
                 raise KeyError(
-                    "No trial with trial number {} exists in study with study_id {}.".format(
-                        trial_number, study_id
-                    )
+                    f"No trial with trial number {trial_number} "
+                    f"exists in study with study_id {study_id}."
                 )
             return trial_id[0]
 
-    def get_trial_number_from_id(self, trial_id: int) -> int:
-
-        trial_number = self.get_trial(trial_id).number
-        return trial_number
-
     def get_trial(self, trial_id: int) -> FrozenTrial:
-
         with _create_scoped_session(self.scoped_session) as session:
             trial_model = models.TrialModel.find_or_raise_by_id(trial_id, session)
             frozen_trial = self._build_frozen_trial_from_trial_model(trial_model)
@@ -998,88 +849,91 @@ class RDBStorage(BaseStorage):
         self,
         study_id: int,
         deepcopy: bool = True,
-        states: Optional[Tuple[TrialState, ...]] = None,
-    ) -> List[FrozenTrial]:
-
-        trials = self._get_trials(study_id, states, set())
+        states: Container[TrialState] | None = None,
+    ) -> list[FrozenTrial]:
+        trials = self._get_trials(study_id, states, set(), -1)
 
         return copy.deepcopy(trials) if deepcopy else trials
 
     def _get_trials(
         self,
         study_id: int,
-        states: Optional[Tuple[TrialState, ...]],
-        excluded_trial_ids: Set[int],
-    ) -> List[FrozenTrial]:
+        states: Container[TrialState] | None,
+        included_trial_ids: set[int],
+        trial_id_greater_than: int,
+    ) -> list[FrozenTrial]:
+        included_trial_ids = set(
+            trial_id for trial_id in included_trial_ids if trial_id <= trial_id_greater_than
+        )
 
         with _create_scoped_session(self.scoped_session) as session:
             # Ensure that the study exists.
             models.StudyModel.find_or_raise_by_id(study_id, session)
-            query = session.query(models.TrialModel.trial_id).filter(
-                models.TrialModel.study_id == study_id
+            query = (
+                session.query(models.TrialModel)
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.params))
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.values))
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.user_attributes))
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.system_attributes))
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.intermediate_values))
+                .filter(
+                    models.TrialModel.study_id == study_id,
+                )
             )
 
             if states is not None:
+                # This assertion is for type checkers, since `states` is required to be Container
+                # in the base class while `models.TrialModel.state.in_` requires Iterable.
+                assert isinstance(states, Iterable)
                 query = query.filter(models.TrialModel.state.in_(states))
 
-            trial_ids = query.all()
-
-            trial_ids = set(
-                trial_id_tuple[0]
-                for trial_id_tuple in trial_ids
-                if trial_id_tuple[0] not in excluded_trial_ids
-            )
             try:
-                trial_models = (
-                    session.query(models.TrialModel)
-                    .options(orm.selectinload(models.TrialModel.params))
-                    .options(orm.selectinload(models.TrialModel.values))
-                    .options(orm.selectinload(models.TrialModel.user_attributes))
-                    .options(orm.selectinload(models.TrialModel.system_attributes))
-                    .options(orm.selectinload(models.TrialModel.intermediate_values))
-                    .filter(
-                        models.TrialModel.trial_id.in_(trial_ids),
-                        models.TrialModel.study_id == study_id,
+                if len(included_trial_ids) > 0 and trial_id_greater_than > -1:
+                    _query = query.filter(
+                        sqlalchemy.or_(
+                            models.TrialModel.trial_id.in_(included_trial_ids),
+                            models.TrialModel.trial_id > trial_id_greater_than,
+                        )
                     )
-                    .all()
-                )
-            except OperationalError as e:
+                elif trial_id_greater_than > -1:
+                    _query = query.filter(models.TrialModel.trial_id > trial_id_greater_than)
+                else:
+                    _query = query
+                trial_models = _query.order_by(models.TrialModel.trial_id).all()
+            except sqlalchemy_exc.OperationalError as e:
                 # Likely exceeding the number of maximum allowed variables using IN.
                 # This number differ between database dialects. For SQLite for instance, see
                 # https://www.sqlite.org/limits.html and the section describing
                 # SQLITE_MAX_VARIABLE_NUMBER.
 
                 _logger.warning(
-                    "Caught an error from sqlalchemy: {}. Falling back to a slower alternative. "
-                    "".format(str(e))
+                    f"Caught an error from sqlalchemy: {e!s}. "
+                    "Falling back to a slower alternative."
                 )
 
-                trial_models = (
-                    session.query(models.TrialModel)
-                    .options(orm.selectinload(models.TrialModel.params))
-                    .options(orm.selectinload(models.TrialModel.values))
-                    .options(orm.selectinload(models.TrialModel.user_attributes))
-                    .options(orm.selectinload(models.TrialModel.system_attributes))
-                    .options(orm.selectinload(models.TrialModel.intermediate_values))
-                    .filter(models.TrialModel.study_id == study_id)
-                    .all()
-                )
-                trial_models = [t for t in trial_models if t.trial_id in trial_ids]
+                trial_models = query.order_by(models.TrialModel.trial_id).all()
+                trial_models = [
+                    t
+                    for t in trial_models
+                    if t.trial_id in included_trial_ids or t.trial_id > trial_id_greater_than
+                ]
 
             trials = [self._build_frozen_trial_from_trial_model(trial) for trial in trial_models]
 
         return trials
 
-    @staticmethod
-    def _build_frozen_trial_from_trial_model(trial: models.TrialModel) -> FrozenTrial:
-
-        values: Optional[List[float]]
+    def _build_frozen_trial_from_trial_model(self, trial: "models.TrialModel") -> FrozenTrial:
+        values: list[float] | None
         if trial.values:
             values = [0 for _ in trial.values]
             for value_model in trial.values:
-                values[value_model.objective] = value_model.value
+                values[value_model.objective] = models.TrialValueModel.stored_repr_to_value(
+                    value_model.value, value_model.value_type
+                )
         else:
             values = None
+
+        params = sorted(trial.params, key=lambda p: p.param_id)
 
         return FrozenTrial(
             number=trial.number,
@@ -1092,46 +946,44 @@ class RDBStorage(BaseStorage):
                 p.param_name: distributions.json_to_distribution(
                     p.distribution_json
                 ).to_external_repr(p.param_value)
-                for p in trial.params
+                for p in params
             },
             distributions={
                 p.param_name: distributions.json_to_distribution(p.distribution_json)
-                for p in trial.params
+                for p in params
             },
             user_attrs={attr.key: json.loads(attr.value_json) for attr in trial.user_attributes},
             system_attrs={
                 attr.key: json.loads(attr.value_json) for attr in trial.system_attributes
             },
-            intermediate_values={v.step: v.intermediate_value for v in trial.intermediate_values},
+            intermediate_values={
+                v.step: models.TrialIntermediateValueModel.stored_repr_to_intermediate_value(
+                    v.intermediate_value, v.intermediate_value_type
+                )
+                for v in trial.intermediate_values
+            },
             trial_id=trial.trial_id,
         )
 
     def get_best_trial(self, study_id: int) -> FrozenTrial:
-
-        with _create_scoped_session(self.scoped_session) as session:
-            _directions = self.get_study_directions(study_id)
-            if len(_directions) > 1:
-                raise ValueError(
-                    "Best trial can be obtained only for single-objective optimization."
-                )
-            direction = _directions[0]
-
-            if direction == StudyDirection.MAXIMIZE:
-                trial = models.TrialModel.find_max_value_trial(study_id, 0, session)
-            else:
-                trial = models.TrialModel.find_min_value_trial(study_id, 0, session)
-            trial_id = trial.trial_id
-
+        _directions = self.get_study_directions(study_id)
+        if len(_directions) > 1:
+            raise RuntimeError(
+                "Best trial can be obtained only for single-objective optimization."
+            )
+        direction = _directions[0]
+        trial_id = self._get_best_trial_id(study_id, direction)
         return self.get_trial(trial_id)
 
-    def read_trials_from_remote_storage(self, study_id: int) -> None:
-        # Make sure that the given study exists.
+    def _get_best_trial_id(self, study_id: int, direction: StudyDirection) -> int:
         with _create_scoped_session(self.scoped_session) as session:
-            models.StudyModel.find_or_raise_by_id(study_id, session)
+            if direction == StudyDirection.MAXIMIZE:
+                return models.TrialModel.find_max_value_trial_id(study_id, 0, session)
+            else:
+                return models.TrialModel.find_min_value_trial_id(study_id, 0, session)
 
     @staticmethod
-    def _set_default_engine_kwargs_for_mysql(url: str, engine_kwargs: Dict[str, Any]) -> None:
-
+    def _set_default_engine_kwargs_for_mysql(url: str, engine_kwargs: dict[str, Any]) -> None:
         # Skip if RDB is not MySQL.
         if not url.startswith("mysql"):
             return
@@ -1149,7 +1001,6 @@ class RDBStorage(BaseStorage):
 
     @staticmethod
     def _fill_storage_url_template(template: str) -> str:
-
         return template.format(SCHEMA_VERSION=models.SCHEMA_VERSION)
 
     def remove_session(self) -> None:
@@ -1182,31 +1033,25 @@ class RDBStorage(BaseStorage):
 
         return self._version_manager.get_head_version()
 
-    def get_all_versions(self) -> List[str]:
+    def get_all_versions(self) -> list[str]:
         """Return the schema version list."""
 
         return self._version_manager.get_all_versions()
 
     def record_heartbeat(self, trial_id: int) -> None:
         with _create_scoped_session(self.scoped_session, True) as session:
+            # Fetch heartbeat with read-only.
             heartbeat = models.TrialHeartbeatModel.where_trial_id(trial_id, session)
-            if heartbeat is None:
+            if heartbeat is None:  # heartbeat record does not exist.
                 heartbeat = models.TrialHeartbeatModel(trial_id=trial_id)
                 session.add(heartbeat)
             else:
-                heartbeat.heartbeat = session.execute(func.now()).scalar()
+                # Re-fetch the existing heartbeat with the write authorization.
+                heartbeat = models.TrialHeartbeatModel.where_trial_id(trial_id, session, True)
+                assert heartbeat is not None
+                heartbeat.heartbeat = session.execute(sqlalchemy.func.now()).scalar_one()
 
-    def fail_stale_trials(self, study_id: int) -> List[int]:
-        stale_trial_ids = self._get_stale_trial_ids(study_id)
-        confirmed_stale_trial_ids = []
-
-        for trial_id in stale_trial_ids:
-            if self.set_trial_state(trial_id, TrialState.FAIL):
-                confirmed_stale_trial_ids.append(trial_id)
-
-        return confirmed_stale_trial_ids
-
-    def _get_stale_trial_ids(self, study_id: int) -> List[int]:
+    def _get_stale_trial_ids(self, study_id: int) -> list[int]:
         assert self.heartbeat_interval is not None
         if self.grace_period is None:
             grace_period = 2 * self.heartbeat_interval
@@ -1215,7 +1060,8 @@ class RDBStorage(BaseStorage):
         stale_trial_ids = []
 
         with _create_scoped_session(self.scoped_session, True) as session:
-            current_heartbeat = session.execute(func.now()).scalar()
+            current_heartbeat = session.execute(sqlalchemy.func.now()).scalar()
+            assert current_heartbeat is not None
             # Added the following line to prevent mixing of timezone-aware and timezone-naive
             # `datetime` in PostgreSQL. See
             # https://github.com/optuna/optuna/pull/2190#issuecomment-766605088 for details
@@ -1223,7 +1069,7 @@ class RDBStorage(BaseStorage):
 
             running_trials = (
                 session.query(models.TrialModel)
-                .options(orm.selectinload(models.TrialModel.heartbeats))
+                .options(sqlalchemy_orm.selectinload(models.TrialModel.heartbeats))
                 .filter(models.TrialModel.state == TrialState.RUNNING)
                 .filter(models.TrialModel.study_id == study_id)
                 .all()
@@ -1233,27 +1079,27 @@ class RDBStorage(BaseStorage):
                     continue
                 assert len(trial.heartbeats) == 1
                 heartbeat = trial.heartbeats[0].heartbeat
-                if (current_heartbeat - heartbeat).seconds > grace_period:
+                if current_heartbeat - heartbeat > timedelta(seconds=grace_period):
                     stale_trial_ids.append(trial.trial_id)
 
         return stale_trial_ids
 
-    def _is_heartbeat_supported(self) -> bool:
-
-        return True
-
-    def get_heartbeat_interval(self) -> Optional[int]:
-
+    def get_heartbeat_interval(self) -> int | None:
         return self.heartbeat_interval
 
-    def get_failed_trial_callback(self) -> Optional[Callable[["optuna.Study", FrozenTrial], None]]:
+    def get_heartbeat_stale_trial_callback(
+        self,
+    ) -> Callable[["optuna.study.Study", FrozenTrial], None] | None:
+        return self.heartbeat_stale_trial_callback
 
-        return self.failed_trial_callback
 
-
-class _VersionManager(object):
-    def __init__(self, url: str, engine: Engine, scoped_session: orm.scoped_session) -> None:
-
+class _VersionManager:
+    def __init__(
+        self,
+        url: str,
+        engine: "sqlalchemy.engine.Engine",
+        scoped_session: "sqlalchemy_orm.scoped_session",
+    ) -> None:
         self.url = url
         self.engine = engine
         self.scoped_session = scoped_session
@@ -1261,44 +1107,44 @@ class _VersionManager(object):
         self._init_alembic()
 
     def _init_version_info_model(self) -> None:
-
         with _create_scoped_session(self.scoped_session, True) as session:
             version_info = models.VersionInfoModel.find(session)
             if version_info is not None:
                 return
 
             version_info = models.VersionInfoModel(
-                schema_version=models.SCHEMA_VERSION, library_version=version.__version__
+                schema_version=models.SCHEMA_VERSION,
+                library_version=version.__version__,
             )
             session.add(version_info)
 
     def _init_alembic(self) -> None:
-
         logging.getLogger("alembic").setLevel(logging.WARN)
 
-        context = alembic.migration.MigrationContext.configure(self.engine.connect())
-        is_initialized = context.get_current_revision() is not None
+        with self.engine.connect() as connection:
+            context = alembic_migration.MigrationContext.configure(connection)
+            is_initialized = context.get_current_revision() is not None
 
-        if is_initialized:
-            # The `alembic_version` table already exists and is not empty.
-            return
+            if is_initialized:
+                # The `alembic_version` table already exists and is not empty.
+                return
 
-        if self._is_alembic_supported():
-            revision = self.get_head_version()
-        else:
-            # The storage has been created before alembic is introduced.
-            revision = self._get_base_version()
+            if self._is_alembic_supported():
+                revision = self.get_head_version()
+            else:
+                # The storage has been created before alembic is introduced.
+                revision = self._get_base_version()
 
         self._set_alembic_revision(revision)
 
     def _set_alembic_revision(self, revision: str) -> None:
-
-        context = alembic.migration.MigrationContext.configure(self.engine.connect())
-        script = self._create_alembic_script()
-        context.stamp(script, revision)
+        with self.engine.connect() as connection:
+            context = alembic_migration.MigrationContext.configure(connection)
+            with connection.begin():
+                script = self._create_alembic_script()
+                context.stamp(script, revision)
 
     def check_table_schema_compatibility(self) -> None:
-
         with _create_scoped_session(self.scoped_session) as session:
             # NOTE: After invocation of `_init_version_info_model` method,
             #       it is ensured that a `VersionInfoModel` entry exists.
@@ -1312,8 +1158,9 @@ class _VersionManager(object):
                 return
 
             message = (
-                "The runtime optuna version {} is no longer compatible with the table schema "
-                "(set up by optuna {}). ".format(version.__version__, version_info.library_version)
+                f"The runtime optuna version {version.__version__} is no longer "
+                "compatible with the table schema "
+                f"(set up by optuna {version_info.library_version}). "
             )
             known_versions = self.get_all_versions()
 
@@ -1330,35 +1177,40 @@ class _VersionManager(object):
         raise RuntimeError(message)
 
     def get_current_version(self) -> str:
-
-        context = alembic.migration.MigrationContext.configure(self.engine.connect())
-        version = context.get_current_revision()
+        with self.engine.connect() as connection:
+            context = alembic_migration.MigrationContext.configure(connection)
+            version = context.get_current_revision()
         assert version is not None
 
         return version
 
     def get_head_version(self) -> str:
-
         script = self._create_alembic_script()
-        return script.get_current_head()
+        current_head = script.get_current_head()
+        assert current_head is not None
+        return current_head
 
     def _get_base_version(self) -> str:
-
         script = self._create_alembic_script()
-        return script.get_base()
+        base = script.get_base()
+        assert base is not None, "There should be exactly one base, i.e. v0.9.0.a."
+        return base
 
-    def get_all_versions(self) -> List[str]:
-
+    def get_all_versions(self) -> list[str]:
         script = self._create_alembic_script()
         return [r.revision for r in script.walk_revisions()]
 
     def upgrade(self) -> None:
-
         config = self._create_alembic_config()
-        alembic.command.upgrade(config, "head")
+        alembic_command.upgrade(config, "head")
+
+        with _create_scoped_session(self.scoped_session, True) as session:
+            version_info = models.VersionInfoModel.find(session)
+            assert version_info is not None
+            version_info.schema_version = models.SCHEMA_VERSION
+            version_info.library_version = version.__version__
 
     def _is_alembic_supported(self) -> bool:
-
         with _create_scoped_session(self.scoped_session) as session:
             version_info = models.VersionInfoModel.find(session)
 
@@ -1368,24 +1220,21 @@ class _VersionManager(object):
 
             return version_info.schema_version == models.SCHEMA_VERSION
 
-    def _create_alembic_script(self) -> alembic.script.ScriptDirectory:
-
+    def _create_alembic_script(self) -> "alembic_script.ScriptDirectory":
         config = self._create_alembic_config()
-        script = alembic.script.ScriptDirectory.from_config(config)
+        script = alembic_script.ScriptDirectory.from_config(config)
         return script
 
-    def _create_alembic_config(self) -> alembic.config.Config:
-
+    def _create_alembic_config(self) -> "alembic_config.Config":
         alembic_dir = os.path.join(os.path.dirname(__file__), "alembic")
 
-        config = alembic.config.Config(os.path.join(os.path.dirname(__file__), "alembic.ini"))
+        config = alembic_config.Config(os.path.join(os.path.dirname(__file__), "alembic.ini"))
         config.set_main_option("script_location", escape_alembic_config_value(alembic_dir))
         config.set_main_option("sqlalchemy.url", escape_alembic_config_value(self.url))
         return config
 
 
 def escape_alembic_config_value(value: str) -> str:
-
     # We must escape '%' in a value string because the character
     # is regarded as the trigger of variable expansion.
     # Please see the documentation of `configparser.BasicInterpolation` for more details.

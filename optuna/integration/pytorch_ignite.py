@@ -1,41 +1,17 @@
-import optuna
-from optuna.trial import Trial
+from optuna import _deprecated
+from optuna._imports import _INTEGRATION_IMPORT_ERROR_TEMPLATE
+from optuna._warnings import optuna_warn
 
 
-with optuna._imports.try_import() as _imports:
-    from ignite.engine import Engine
+try:
+    from optuna_integration.pytorch_ignite import PyTorchIgnitePruningHandler
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(_INTEGRATION_IMPORT_ERROR_TEMPLATE.format("pytorch_ignite"))
+
+msg = _deprecated._DEPRECATION_WARNING_TEMPLATE.format(
+    name="`optuna.integration.pytorch_ignite`", d_ver="4.9.0", r_ver="6.0.0"
+)
+optuna_warn(f"{msg} Use `optuna_integration.pytorch_ignite` instead.", FutureWarning)
 
 
-class PyTorchIgnitePruningHandler(object):
-    """PyTorch Ignite handler to prune unpromising trials.
-
-    See `the example <https://github.com/optuna/optuna/blob/master/
-    examples/pytorch/pytorch_ignite_simple.py>`__
-    if you want to add a pruning handler which observes validation accuracy.
-
-    Args:
-        trial:
-            A :class:`~optuna.trial.Trial` corresponding to the current evaluation of the
-            objective function.
-        metric:
-            A name of metric for pruning, e.g., ``accuracy`` and ``loss``.
-        trainer:
-            A trainer engine of PyTorch Ignite. Please refer to `ignite.engine.Engine reference
-            <https://pytorch.org/ignite/engine.html#ignite.engine.Engine>`_ for further details.
-    """
-
-    def __init__(self, trial: Trial, metric: str, trainer: "Engine") -> None:
-
-        _imports.check()
-
-        self._trial = trial
-        self._metric = metric
-        self._trainer = trainer
-
-    def __call__(self, engine: "Engine") -> None:
-
-        score = engine.state.metrics[self._metric]
-        self._trial.report(score, self._trainer.state.epoch)
-        if self._trial.should_prune():
-            message = "Trial was pruned at {} epoch.".format(self._trainer.state.epoch)
-            raise optuna.TrialPruned(message)
+__all__ = ["PyTorchIgnitePruningHandler"]

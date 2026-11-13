@@ -1,121 +1,50 @@
+import os
 import sys
+from types import ModuleType
+from typing import Any
+from typing import TYPE_CHECKING
 
-import optuna
-from optuna._imports import try_import
-from optuna.integration import _lightgbm_tuner as tuner
-
-
-with try_import() as _imports:
-    import lightgbm as lgb  # NOQA
-    from lightgbm.callback import CallbackEnv  # NOQA
-
-# Attach lightgbm API.
-if _imports.is_successful():
-    # To pass tests/integration_tests/lightgbm_tuner_tests/test_optimize.py.
-    from lightgbm import Dataset  # NOQA
-
-    from optuna.integration._lightgbm_tuner import LightGBMTuner  # NOQA
-    from optuna.integration._lightgbm_tuner import LightGBMTunerCV  # NOQA
-
-    _names_from_tuners = ["train", "LGBMModel", "LGBMClassifier", "LGBMRegressor"]
-
-    # API from lightgbm.
-    for api_name in lgb.__dict__["__all__"]:
-        if api_name in _names_from_tuners:
-            continue
-        setattr(sys.modules[__name__], api_name, lgb.__dict__[api_name])
-
-    # API from lightgbm_tuner.
-    for api_name in _names_from_tuners:
-        setattr(sys.modules[__name__], api_name, tuner.__dict__[api_name])
-else:
-    # To create docstring of train.
-    setattr(sys.modules[__name__], "train", tuner.__dict__["train"])
-    setattr(sys.modules[__name__], "LightGBMTuner", tuner.__dict__["LightGBMTuner"])
-    setattr(sys.modules[__name__], "LightGBMTunerCV", tuner.__dict__["LightGBMTunerCV"])
+from optuna import _deprecated
+from optuna._imports import _INTEGRATION_IMPORT_ERROR_TEMPLATE
+from optuna._warnings import optuna_warn
 
 
-class LightGBMPruningCallback(object):
-    """Callback for LightGBM to prune unpromising trials.
+try:
+    import optuna_integration.lightgbm as lgb
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(_INTEGRATION_IMPORT_ERROR_TEMPLATE.format("lightgbm"))
 
-    See `the example <https://github.com/optuna/optuna/blob/master/
-    examples/lightgbm/lightgbm_integration.py>`__
-    if you want to add a pruning callback which observes AUC
-    of a LightGBM model.
+msg = _deprecated._DEPRECATION_WARNING_TEMPLATE.format(
+    name="`optuna.integration.lightgbm`", d_ver="4.9.0", r_ver="6.0.0"
+)
+optuna_warn(f"{msg} Use `optuna_integration.lightgbm` instead.", FutureWarning)
 
-    Args:
-        trial:
-            A :class:`~optuna.trial.Trial` corresponding to the current evaluation of
-            the objective function.
-        metric:
-            An evaluation metric for pruning, e.g., ``binary_error`` and ``multi_error``.
-            Please refer to
-            `LightGBM reference
-            <https://lightgbm.readthedocs.io/en/latest/Parameters.html#metric>`_
-            for further details.
-        valid_name:
-            The name of the target validation.
-            Validation names are specified by ``valid_names`` option of
-            `train method
-            <https://lightgbm.readthedocs.io/en/latest/Python-API.html#lightgbm.train>`_.
-            If omitted, ``valid_0`` is used which is the default name of the first validation.
-            Note that this argument will be ignored if you are calling
-            `cv method <https://lightgbm.readthedocs.io/en/latest/Python-API.html#lightgbm.cv>`_
-            instead of train method.
-    """
 
-    def __init__(
-        self, trial: optuna.trial.Trial, metric: str, valid_name: str = "valid_0"
-    ) -> None:
+if TYPE_CHECKING:
+    # These modules are from optuna-integration.
+    from optuna.integration.lightgbm_tuner import LightGBMPruningCallback
+    from optuna.integration.lightgbm_tuner import LightGBMTuner
+    from optuna.integration.lightgbm_tuner import LightGBMTunerCV
+    from optuna.integration.lightgbm_tuner import train
 
-        _imports.check()
 
-        self._trial = trial
-        self._valid_name = valid_name
-        self._metric = metric
+__all__ = [
+    "LightGBMPruningCallback",
+    "LightGBMTuner",
+    "LightGBMTunerCV",
+    "train",
+]
 
-    def __call__(self, env: "CallbackEnv") -> None:
 
-        # If this callback has been passed to `lightgbm.cv` function,
-        # the value of `is_cv` becomes `True`. See also:
-        # https://github.com/Microsoft/LightGBM/blob/v2.2.2/python-package/lightgbm/engine.py#L329
-        # Note that `5` is not the number of folds but the length of sequence.
-        is_cv = len(env.evaluation_result_list) > 0 and len(env.evaluation_result_list[0]) == 5
-        if is_cv:
-            target_valid_name = "cv_agg"
-        else:
-            target_valid_name = self._valid_name
+class _LightGBMModule(ModuleType):
+    """Module class that implements `optuna.integration.lightgbm` package."""
 
-        for evaluation_result in env.evaluation_result_list:
-            valid_name, metric, current_score, is_higher_better = evaluation_result[:4]
-            if valid_name != target_valid_name or metric != self._metric:
-                continue
+    __all__ = __all__
+    __file__ = globals()["__file__"]
+    __path__ = [os.path.dirname(__file__)]
 
-            if is_higher_better:
-                if self._trial.study.direction != optuna.study.StudyDirection.MAXIMIZE:
-                    raise ValueError(
-                        "The intermediate values are inconsistent with the objective values in "
-                        "terms of study directions. Please specify a metric to be minimized for "
-                        "LightGBMPruningCallback."
-                    )
-            else:
-                if self._trial.study.direction != optuna.study.StudyDirection.MINIMIZE:
-                    raise ValueError(
-                        "The intermediate values are inconsistent with the objective values in "
-                        "terms of study directions. Please specify a metric to be maximized for "
-                        "LightGBMPruningCallback."
-                    )
+    def __getattr__(self, name: str) -> Any:
+        return lgb.__dict__[name]
 
-            self._trial.report(current_score, step=env.iteration)
-            if self._trial.should_prune():
-                message = "Trial was pruned at iteration {}.".format(env.iteration)
-                raise optuna.TrialPruned(message)
 
-            return None
-
-        raise ValueError(
-            'The entry associated with the validation name "{}" and the metric name "{}" '
-            "is not found in the evaluation result list {}.".format(
-                target_valid_name, self._metric, str(env.evaluation_result_list)
-            )
-        )
+sys.modules[__name__] = _LightGBMModule(__name__)

@@ -14,7 +14,6 @@ With optional arguments of ``step`` and ``log``, we can discretize or take the l
 integer and floating point parameters.
 """
 
-
 import optuna
 
 
@@ -49,7 +48,7 @@ def objective(trial):
 #
 # Also, you can use branches or loops depending on the parameter values.
 #
-# For more various use, see `examples <https://github.com/optuna/optuna/tree/master/examples>`_.
+# For more various use, see `examples <https://github.com/optuna/optuna-examples/>`__.
 
 ###################################################################################################
 # - Branches:
@@ -81,7 +80,7 @@ def objective(trial):
 #
 #         layers = []
 #         for i in range(n_layers):
-#             n_units = trial.suggest_int("n_units_l{}".format(i), 4, 128, log=True)
+#             n_units = trial.suggest_int(f"n_units_l{i}", 4, 128, log=True)
 #             layers.append(nn.Linear(in_size, n_units))
 #             layers.append(nn.ReLU())
 #             in_size = n_units

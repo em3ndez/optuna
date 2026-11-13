@@ -1,26 +1,29 @@
+from __future__ import annotations
+
 from typing import Any
-from typing import Dict
-from typing import Optional
-from typing import Sequence
-import warnings
+from typing import TYPE_CHECKING
 
-from optuna._experimental import experimental
-from optuna.distributions import BaseDistribution
+from optuna._experimental import experimental_class
+from optuna._warnings import optuna_warn
 from optuna.samplers import BaseSampler
-from optuna.study import Study
-from optuna.trial import FrozenTrial
-from optuna.trial import TrialState
 
 
-@experimental("2.4.0")
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from optuna.distributions import BaseDistribution
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
+    from optuna.trial import TrialState
+
+
+@experimental_class("2.4.0")
 class PartialFixedSampler(BaseSampler):
     """Sampler with partially fixed parameters.
 
-        .. versionadded:: 2.4.0
-
     Example:
 
-         After several steps of optimization, you can fix the value of ``y`` and re-optimize it.
+        After several steps of optimization, you can fix the value of ``y`` and re-optimize it.
 
         .. testcode::
 
@@ -30,7 +33,7 @@ class PartialFixedSampler(BaseSampler):
             def objective(trial):
                 x = trial.suggest_float("x", -1, 1)
                 y = trial.suggest_int("y", -1, 1)
-                return x ** 2 + y
+                return x**2 + y
 
 
             study = optuna.create_study()
@@ -53,7 +56,7 @@ class PartialFixedSampler(BaseSampler):
 
     """
 
-    def __init__(self, fixed_params: Dict[str, Any], base_sampler: BaseSampler) -> None:
+    def __init__(self, fixed_params: dict[str, Any], base_sampler: BaseSampler) -> None:
         self._fixed_params = fixed_params
         self._base_sampler = base_sampler
 
@@ -62,8 +65,7 @@ class PartialFixedSampler(BaseSampler):
 
     def infer_relative_search_space(
         self, study: Study, trial: FrozenTrial
-    ) -> Dict[str, BaseDistribution]:
-
+    ) -> dict[str, BaseDistribution]:
         search_space = self._base_sampler.infer_relative_search_space(study, trial)
 
         # Remove fixed params from relative search space to return fixed values.
@@ -77,9 +79,8 @@ class PartialFixedSampler(BaseSampler):
         self,
         study: Study,
         trial: FrozenTrial,
-        search_space: Dict[str, BaseDistribution],
-    ) -> Dict[str, Any]:
-
+        search_space: dict[str, BaseDistribution],
+    ) -> dict[str, Any]:
         # Fixed params are never sampled here.
         return self._base_sampler.sample_relative(study, trial, search_space)
 
@@ -90,11 +91,7 @@ class PartialFixedSampler(BaseSampler):
         param_name: str,
         param_distribution: BaseDistribution,
     ) -> Any:
-
-        # If param_name isn't in self._fixed_params.keys(), param_value is set to None.
-        param_value = self._fixed_params.get(param_name)
-
-        if param_value is None:
+        if param_name not in self._fixed_params:
             # Unfixed params are sampled here.
             return self._base_sampler.sample_independent(
                 study, trial, param_name, param_distribution
@@ -102,22 +99,26 @@ class PartialFixedSampler(BaseSampler):
         else:
             # Fixed params are sampled here.
             # Check if a parameter value is contained in the range of this distribution.
+            param_value = self._fixed_params[param_name]
+
             param_value_in_internal_repr = param_distribution.to_internal_repr(param_value)
             contained = param_distribution._contains(param_value_in_internal_repr)
 
             if not contained:
-                warnings.warn(
+                optuna_warn(
                     f"Fixed parameter '{param_name}' with value {param_value} is out of range "
                     f"for distribution {param_distribution}."
                 )
             return param_value
+
+    def before_trial(self, study: Study, trial: FrozenTrial) -> None:
+        self._base_sampler.before_trial(study, trial)
 
     def after_trial(
         self,
         study: Study,
         trial: FrozenTrial,
         state: TrialState,
-        values: Optional[Sequence[float]],
+        values: Sequence[float] | None,
     ) -> None:
-
         self._base_sampler.after_trial(study, trial, state, values)

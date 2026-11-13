@@ -1,10 +1,14 @@
+from __future__ import annotations
+
+import binascii
 import math
-from typing import List
-from typing import Optional
-from typing import Tuple
-from typing import Union
+from typing import TYPE_CHECKING
 
 import optuna
+
+
+if TYPE_CHECKING:
+    from collections.abc import Container
 from optuna import logging
 from optuna.pruners._base import BasePruner
 from optuna.pruners._successive_halving import SuccessiveHalvingPruner
@@ -21,7 +25,7 @@ class HyperbandPruner(BasePruner):
     :math:`n` as its hyperparameter.  For a given finite budget :math:`B`,
     all the configurations have the resources of :math:`B \\over n` on average.
     As you can see, there will be a trade-off of :math:`B` and :math:`B \\over n`.
-    `Hyperband <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`_ attacks this trade-off
+    `Hyperband <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`__ attacks this trade-off
     by trying different :math:`n` values for a fixed budget.
 
     .. note::
@@ -29,17 +33,17 @@ class HyperbandPruner(BasePruner):
           is used.
         * Optuna uses :class:`~optuna.samplers.TPESampler` by default.
         * `The benchmark result
-          <https://github.com/optuna/optuna/pull/828#issuecomment-575457360>`_
+          <https://github.com/optuna/optuna/pull/828#issuecomment-575457360>`__
           shows that :class:`optuna.pruners.HyperbandPruner` supports both samplers.
 
     .. note::
         If you use ``HyperbandPruner`` with :class:`~optuna.samplers.TPESampler`,
-        it's recommended to consider to set larger ``n_trials`` or ``timeout`` to make full use of
+        it's recommended to consider setting larger ``n_trials`` or ``timeout`` to make full use of
         the characteristics of :class:`~optuna.samplers.TPESampler`
         because :class:`~optuna.samplers.TPESampler` uses some (by default, :math:`10`)
         :class:`~optuna.trial.Trial`\\ s for its startup.
 
-        As Hyperband runs multiple :class:`~optuna.pruners.SuccessiveHalvingPruner` and collect
+        As Hyperband runs multiple :class:`~optuna.pruners.SuccessiveHalvingPruner` and collects
         trials based on the current :class:`~optuna.trial.Trial`\\ 's bracket ID, each bracket
         needs to observe more than :math:`10` :class:`~optuna.trial.Trial`\\ s
         for :class:`~optuna.samplers.TPESampler` to adapt its search space.
@@ -48,18 +52,23 @@ class HyperbandPruner(BasePruner):
         at least :math:`4 \\times 10` trials are consumed for startup.
 
     .. note::
-        Hyperband has several :class:`~optuna.pruners.SuccessiveHalvingPruner`. Each
-        :class:`~optuna.pruners.SuccessiveHalvingPruner` is referred as "bracket" in the original
-        paper. The number of brackets is an important factor to control the early stopping behavior
-        of Hyperband and is automatically determined by ``min_resource``, ``max_resource`` and
-        ``reduction_factor`` as
-        `The number of brackets = floor(log_{reduction_factor}(max_resource / min_resource)) + 1`.
-        Please set ``reduction_factor`` so that the number of brackets is not too large (about 4 ~
+        Hyperband has several :class:`~optuna.pruners.SuccessiveHalvingPruner`\\ s. Each
+        :class:`~optuna.pruners.SuccessiveHalvingPruner` is referred to as "bracket" in the
+        original paper. The number of brackets is an important factor to control the early
+        stopping behavior of Hyperband and is automatically determined by ``min_resource``,
+        ``max_resource`` and ``reduction_factor`` as
+        :math:`\\mathrm{The\\ number\\ of\\ brackets} =
+        \\mathrm{floor}(\\log_{\\texttt{reduction}\\_\\texttt{factor}}
+        (\\frac{\\texttt{max}\\_\\texttt{resource}}{\\texttt{min}\\_\\texttt{resource}})) + 1`.
+        Please set ``reduction_factor`` so that the number of brackets is not too large (about 4 –
         6 in most use cases). Please see Section 3.6 of the `original paper
-        <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`_ for the detail.
+        <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`__ for the detail.
 
-    .. seealso::
-        Please refer to :meth:`~optuna.trial.Trial.report`.
+    .. note::
+        ``HyperbandPruner`` computes bracket ID for each trial with a
+        function taking ``study_name`` of :class:`~optuna.study.Study` and
+        :attr:`~optuna.trial.Trial.number`. Please specify ``study_name``
+        to make the pruning algorithm reproducible.
 
     Example:
 
@@ -132,37 +141,36 @@ class HyperbandPruner(BasePruner):
             See the details for :class:`~optuna.pruners.SuccessiveHalvingPruner`.
         bootstrap_count:
             Parameter specifying the number of trials required in a rung before any trial can be
-            promoted. Incompatible with ``max_resouce`` is ``"auto"``.
+            promoted. Incompatible with ``max_resource`` is ``"auto"``.
             See the details for :class:`~optuna.pruners.SuccessiveHalvingPruner`.
     """
 
     def __init__(
         self,
         min_resource: int = 1,
-        max_resource: Union[str, int] = "auto",
+        max_resource: str | int = "auto",
         reduction_factor: int = 3,
         bootstrap_count: int = 0,
     ) -> None:
-
         self._min_resource = min_resource
         self._max_resource = max_resource
         self._reduction_factor = reduction_factor
-        self._pruners: List[SuccessiveHalvingPruner] = []
+        self._pruners: list[SuccessiveHalvingPruner] = []
         self._bootstrap_count = bootstrap_count
         self._total_trial_allocation_budget = 0
-        self._trial_allocation_budgets: List[int] = []
-        self._n_brackets: Optional[int] = None
+        self._trial_allocation_budgets: list[int] = []
+        self._n_brackets: int | None = None
 
         if not isinstance(self._max_resource, int) and self._max_resource != "auto":
             raise ValueError(
                 "The 'max_resource' should be integer or 'auto'. "
-                "But max_resource = {}".format(self._max_resource)
+                f"But max_resource = {self._max_resource}"
             )
 
         if self._bootstrap_count > 0 and self._max_resource == "auto":
             raise ValueError(
                 "bootstrap_count > 0 and max_resource == 'auto' "
-                "are mutually incompatible, bootstrap_count is {}".format(self._bootstrap_count)
+                f"are mutually incompatible, bootstrap_count is {self._bootstrap_count}"
             )
 
     def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
@@ -172,18 +180,14 @@ class HyperbandPruner(BasePruner):
                 return False
 
         bracket_id = self._get_bracket_id(study, trial)
-        _logger.debug("{}th bracket is selected".format(bracket_id))
+        _logger.debug(f"{bracket_id}th bracket is selected")
         bracket_study = self._create_bracket_study(study, bracket_id)
         return self._pruners[bracket_id].prune(bracket_study, trial)
 
     def _try_initialization(self, study: "optuna.study.Study") -> None:
         if self._max_resource == "auto":
-            trials = study.get_trials(deepcopy=False)
-            n_steps = [
-                t.last_step
-                for t in trials
-                if t.state == TrialState.COMPLETE and t.last_step is not None
-            ]
+            trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+            n_steps = [t.last_step for t in trials if t.last_step is not None]
 
             if not n_steps:
                 return
@@ -207,7 +211,7 @@ class HyperbandPruner(BasePruner):
                 + 1
             )
 
-        _logger.debug("Hyperband has {} brackets".format(self._n_brackets))
+        _logger.debug(f"Hyperband has {self._n_brackets} brackets")
 
         for bracket_id in range(self._n_brackets):
             trial_allocation_budget = self._calculate_trial_allocation_budget(bracket_id)
@@ -233,7 +237,7 @@ class HyperbandPruner(BasePruner):
 
         assert self._n_brackets is not None
         s = self._n_brackets - 1 - bracket_id
-        return math.ceil(self._n_brackets * (self._reduction_factor ** s) / (s + 1))
+        return math.ceil(self._n_brackets * (self._reduction_factor**s) / (s + 1))
 
     def _get_bracket_id(
         self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial"
@@ -241,7 +245,7 @@ class HyperbandPruner(BasePruner):
         """Compute the index of bracket for a trial of ``trial_number``.
 
         The index of a bracket is noted as :math:`s` in
-        `Hyperband paper <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`_.
+        `Hyperband paper <http://www.jmlr.org/papers/volume18/16-558/16-558.pdf>`__.
         """
 
         if len(self._pruners) == 0:
@@ -249,7 +253,7 @@ class HyperbandPruner(BasePruner):
 
         assert self._n_brackets is not None
         n = (
-            hash("{}_{}".format(study.study_name, trial.number))
+            binascii.crc32(f"{study.study_name}_{trial.number}".encode())
             % self._total_trial_allocation_budget
         )
         for bracket_id in range(self._n_brackets):
@@ -267,11 +271,12 @@ class HyperbandPruner(BasePruner):
         # `direction`, and `storage` are used.
         # But for safety, prohibit the other attributes explicitly.
         class _BracketStudy(optuna.study.Study):
-
             _VALID_ATTRS = (
                 "get_trials",
+                "_get_trials",
                 "directions",
                 "direction",
+                "_directions",
                 "_storage",
                 "_study_id",
                 "pruner",
@@ -282,14 +287,17 @@ class HyperbandPruner(BasePruner):
                 "_is_multi_objective",
                 "stop",
                 "_study",
+                "_thread_local",
             )
 
-            def __init__(self, study: "optuna.study.Study", bracket_id: int) -> None:
+            def __init__(
+                self, study: "optuna.study.Study", pruner: HyperbandPruner, bracket_id: int
+            ) -> None:
                 super().__init__(
                     study_name=study.study_name,
                     storage=study._storage,
                     sampler=study.sampler,
-                    pruner=study.pruner,
+                    pruner=pruner,
                 )
                 self._study = study
                 self._bracket_id = bracket_id
@@ -297,9 +305,9 @@ class HyperbandPruner(BasePruner):
             def get_trials(
                 self,
                 deepcopy: bool = True,
-                states: Optional[Tuple[TrialState, ...]] = None,
-            ) -> List["optuna.trial.FrozenTrial"]:
-                trials = super().get_trials(deepcopy=deepcopy, states=states)
+                states: Container[TrialState] | None = None,
+            ) -> list["optuna.trial.FrozenTrial"]:
+                trials = super()._get_trials(deepcopy=deepcopy, states=states)
                 pruner = self.pruner
                 assert isinstance(pruner, HyperbandPruner)
                 return [t for t in trials if pruner._get_bracket_id(self, t) == self._bracket_id]
@@ -311,10 +319,8 @@ class HyperbandPruner(BasePruner):
 
             def __getattribute__(self, attr_name):  # type: ignore
                 if attr_name not in _BracketStudy._VALID_ATTRS:
-                    raise AttributeError(
-                        "_BracketStudy does not have attribute of '{}'".format(attr_name)
-                    )
+                    raise AttributeError(f"_BracketStudy does not have attribute of '{attr_name}'")
                 else:
                     return object.__getattribute__(self, attr_name)
 
-        return _BracketStudy(study, bracket_id)
+        return _BracketStudy(study, self, bracket_id)

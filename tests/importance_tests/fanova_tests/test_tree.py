@@ -1,10 +1,9 @@
+from __future__ import annotations
+
 import math
-from typing import Dict
-from typing import List
-from typing import Tuple
 from unittest.mock import Mock
 
-import numpy
+import numpy as np
 import pytest
 
 from optuna.importance._fanova._tree import _FanovaTree
@@ -18,16 +17,17 @@ def tree() -> _FanovaTree:
     sklearn_tree.feature = [1, 2, -1, -1, -1]
     sklearn_tree.children_left = [1, 2, -1, -1, -1]
     sklearn_tree.children_right = [4, 3, -1, -1, -1]
-    sklearn_tree.value = [-1.0, -1.0, 0.1, 0.2, 0.5]
+    # value has the shape (node_count, n_output, max_n_classes)
+    sklearn_tree.value = np.array([[[-1.0]], [[-1.0]], [[0.1]], [[0.2]], [[0.5]]])
     sklearn_tree.threshold = [0.5, 1.5, -1.0, -1.0, -1.0]
 
-    search_spaces = numpy.array([[0.0, 1.0], [0.0, 1.0], [0.0, 2.0]])
+    search_spaces = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 2.0]])
 
     return _FanovaTree(tree=sklearn_tree, search_spaces=search_spaces)
 
 
 @pytest.fixture
-def expected_tree_statistics() -> List[Dict[str, List]]:
+def expected_tree_statistics() -> list[dict[str, list]]:
     # Statistics the each node in the tree.
     return [
         {"values": [0.1, 0.2, 0.5], "weights": [0.75, 0.25, 1.0]},
@@ -38,13 +38,13 @@ def expected_tree_statistics() -> List[Dict[str, List]]:
     ]
 
 
-def test_tree_variance(tree: _FanovaTree, expected_tree_statistics: List[Dict[str, List]]) -> None:
+def test_tree_variance(tree: _FanovaTree, expected_tree_statistics: list[dict[str, list]]) -> None:
     # The root node at node index `0` holds the values and weights for all nodes in the tree.
     expected_statistics = expected_tree_statistics[0]
     expected_values = expected_statistics["values"]
     expected_weights = expected_statistics["weights"]
-    expected_average_value = numpy.average(expected_values, weights=expected_weights)
-    expected_variance = numpy.average(
+    expected_average_value = np.average(expected_values, weights=expected_weights)
+    expected_variance = np.average(
         (expected_values - expected_average_value) ** 2, weights=expected_weights
     )
 
@@ -86,11 +86,11 @@ Cardinality = float
 )
 def test_tree_get_marginal_variance(
     tree: _FanovaTree,
-    features: List[int],
-    expected: List[Tuple[List[Size], List[Tuple[NodeIndex, Cardinality]]]],
-    expected_tree_statistics: List[Dict[str, List]],
+    features: list[int],
+    expected: list[tuple[list[Size], list[tuple[NodeIndex, Cardinality]]]],
+    expected_tree_statistics: list[dict[str, list]],
 ) -> None:
-    variance = tree.get_marginal_variance(numpy.array(features))
+    variance = tree.get_marginal_variance(np.array(features))
 
     expected_values = []
     expected_weights = []
@@ -107,13 +107,13 @@ def test_tree_get_marginal_variance(
                 [w / cardinality for w in expected_statistics["weights"]]
             )
 
-        expected_value = numpy.average(expected_split_values, weights=expected_split_weights)
-        expected_weight = numpy.prod(numpy.array(sizes) * numpy.sum(expected_split_weights))
+        expected_value = np.average(expected_split_values, weights=expected_split_weights)
+        expected_weight = np.prod(np.array(sizes) * np.sum(expected_split_weights))
         expected_values.append(expected_value)
         expected_weights.append(expected_weight)
 
-    expected_average_value = numpy.average(expected_values, weights=expected_weights)
-    expected_variance = numpy.average(
+    expected_average_value = np.average(expected_values, weights=expected_weights)
+    expected_variance = np.average(
         (expected_values - expected_average_value) ** 2, weights=expected_weights
     )
 
@@ -144,11 +144,11 @@ def test_tree_get_marginal_variance(
 )
 def test_tree_get_marginalized_statistics(
     tree: _FanovaTree,
-    feature_vector: List[float],
-    expected: List[Tuple[NodeIndex, Cardinality]],
-    expected_tree_statistics: List[Dict[str, List]],
+    feature_vector: list[float],
+    expected: list[tuple[NodeIndex, Cardinality]],
+    expected_tree_statistics: list[dict[str, list]],
 ) -> None:
-    value, weight = tree._get_marginalized_statistics(numpy.array(feature_vector))
+    value, weight = tree._get_marginalized_statistics(np.array(feature_vector))
 
     expected_values = []
     expected_weights = []
@@ -158,15 +158,15 @@ def test_tree_get_marginalized_statistics(
         expected_values.append(expected_statistics["values"])
         expected_weights.append([w / cardinality for w in expected_statistics["weights"]])
 
-    expected_value = numpy.average(expected_values, weights=expected_weights)
-    expected_weight = numpy.sum(expected_weights)
+    expected_value = np.average(expected_values, weights=expected_weights)
+    expected_weight = np.sum(expected_weights)
 
     assert math.isclose(value, expected_value)
     assert math.isclose(weight, expected_weight)
 
 
 def test_tree_statistics(
-    tree: _FanovaTree, expected_tree_statistics: List[Dict[str, List]]
+    tree: _FanovaTree, expected_tree_statistics: list[dict[str, list]]
 ) -> None:
     statistics = tree._statistics
 
@@ -175,7 +175,7 @@ def test_tree_statistics(
 
         expected_values = expected_statistic["values"]
         expected_weights = expected_statistic["weights"]
-        expected_value = numpy.average(expected_values, weights=expected_weights)
+        expected_value = np.average(expected_values, weights=expected_weights)
 
         assert math.isclose(value, expected_value)
         assert math.isclose(weight, sum(expected_weights))
@@ -183,14 +183,14 @@ def test_tree_statistics(
 
 @pytest.mark.parametrize("node_index,expected", [(0, [0.5]), (1, [0.25, 0.75]), (2, [0.75, 1.75])])
 def test_tree_split_midpoints(
-    tree: _FanovaTree, node_index: NodeIndex, expected: List[float]
+    tree: _FanovaTree, node_index: NodeIndex, expected: list[float]
 ) -> None:
-    numpy.testing.assert_equal(tree._split_midpoints[node_index], expected)
+    np.testing.assert_equal(tree._split_midpoints[node_index], expected)
 
 
 @pytest.mark.parametrize("node_index,expected", [(0, [1.0]), (1, [0.5, 0.5]), (2, [1.5, 0.5])])
-def test_tree_split_sizes(tree: _FanovaTree, node_index: NodeIndex, expected: List[float]) -> None:
-    numpy.testing.assert_equal(tree._split_sizes[node_index], expected)
+def test_tree_split_sizes(tree: _FanovaTree, node_index: NodeIndex, expected: list[float]) -> None:
+    np.testing.assert_equal(tree._split_sizes[node_index], expected)
 
 
 @pytest.mark.parametrize(
@@ -204,9 +204,9 @@ def test_tree_split_sizes(tree: _FanovaTree, node_index: NodeIndex, expected: Li
     ],
 )
 def test_tree_subtree_active_features(
-    tree: _FanovaTree, node_index: NodeIndex, expected: List[bool]
+    tree: _FanovaTree, node_index: NodeIndex, expected: list[bool]
 ) -> None:
-    active_features: numpy.ndarray = tree._subtree_active_features[node_index] == expected
+    active_features: np.ndarray = tree._subtree_active_features[node_index] == expected
     assert active_features.all()
 
 
@@ -256,41 +256,41 @@ def test_tree_attrs(tree: _FanovaTree) -> None:
 
 
 def test_tree_get_node_subspaces(tree: _FanovaTree) -> None:
-    search_spaces = numpy.array([[0.0, 1.0], [0.0, 1.0], [0.0, 2.0]])
+    search_spaces = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 2.0]])
     search_spaces_copy = search_spaces.copy()
 
     # Test splitting on second feature, first node.
-    expected_left_child_subspace = numpy.array([[0.0, 1.0], [0.0, 0.5], [0.0, 2.0]])
-    expected_right_child_subspace = numpy.array([[0.0, 1.0], [0.5, 1.0], [0.0, 2.0]])
+    expected_left_child_subspace = np.array([[0.0, 1.0], [0.0, 0.5], [0.0, 2.0]])
+    expected_right_child_subspace = np.array([[0.0, 1.0], [0.5, 1.0], [0.0, 2.0]])
 
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_left_child_subspaces(0, search_spaces), expected_left_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_right_child_subspaces(0, search_spaces), expected_right_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_children_subspaces(0, search_spaces)[0], expected_left_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_children_subspaces(0, search_spaces)[1], expected_right_child_subspace
     )
-    numpy.testing.assert_array_equal(search_spaces, search_spaces_copy)
+    np.testing.assert_array_equal(search_spaces, search_spaces_copy)
 
     # Test splitting on third feature, second node.
-    expected_left_child_subspace = numpy.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.5]])
-    expected_right_child_subspace = numpy.array([[0.0, 1.0], [0.0, 1.0], [1.5, 2.0]])
+    expected_left_child_subspace = np.array([[0.0, 1.0], [0.0, 1.0], [0.0, 1.5]])
+    expected_right_child_subspace = np.array([[0.0, 1.0], [0.0, 1.0], [1.5, 2.0]])
 
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_left_child_subspaces(1, search_spaces), expected_left_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_right_child_subspaces(1, search_spaces), expected_right_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_children_subspaces(1, search_spaces)[0], expected_left_child_subspace
     )
-    numpy.testing.assert_array_equal(
+    np.testing.assert_array_equal(
         tree._get_node_children_subspaces(1, search_spaces)[1], expected_right_child_subspace
     )
-    numpy.testing.assert_array_equal(search_spaces, search_spaces_copy)
+    np.testing.assert_array_equal(search_spaces, search_spaces_copy)

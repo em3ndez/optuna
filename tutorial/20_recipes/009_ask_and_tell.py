@@ -20,6 +20,7 @@ Apply Optuna to an existing optimization problem with minimum modifications
 Let's consider the traditional supervised classification problem; you aim to maximize the validation accuracy.
 To do so, you train `LogisticRegression` as a simple model.
 """
+
 import numpy as np
 from sklearn.datasets import make_classification
 from sklearn.linear_model import LogisticRegression
@@ -46,7 +47,7 @@ def objective(trial):
     X, y = make_classification(n_features=10)
     X_train, X_test, y_train, y_test = train_test_split(X, y)
 
-    C = trial.suggest_loguniform("C", 1e-7, 10.0)
+    C = trial.suggest_float("C", 1e-7, 10.0, log=True)
     solver = trial.suggest_categorical("solver", ("lbfgs", "saga"))
 
     clf = LogisticRegression(C=C, solver=solver)
@@ -63,7 +64,7 @@ study.optimize(objective, n_trials=10)
 # This interface is not flexible enough.
 # For example, if ``objective`` requires additional arguments other than ``trial``,
 # you need to define a class as in
-# `How to define objective functions that have own arguments? <../../faq.html#how-to-define-objective-functions-that-have-own-arguments>`_.
+# `How to define objective functions that have own arguments? <../../faq.html#how-to-define-objective-functions-that-have-own-arguments>`__.
 # The ask-and-tell interface provides a more flexible syntax to optimize hyperparameters.
 # The following example is equivalent to the previous code block.
 
@@ -73,7 +74,7 @@ n_trials = 10
 for _ in range(n_trials):
     trial = study.ask()  # `trial` is a `Trial` and not a `FrozenTrial`.
 
-    C = trial.suggest_loguniform("C", 1e-7, 10.0)
+    C = trial.suggest_float("C", 1e-7, 10.0, log=True)
     solver = trial.suggest_categorical("solver", ("lbfgs", "saga"))
 
     clf = LogisticRegression(C=C, solver=solver)
@@ -119,7 +120,7 @@ for _ in range(n_trials):
 #    for _ in range(20):
 #        trial = study.ask()
 #
-#        alpha = trial.suggest_uniform("alpha", 0.0, 1.0)
+#        alpha = trial.suggest_float("alpha", 0.0, 1.0)
 #
 #        clf = SGDClassifier(alpha=alpha)
 #        pruned_trial = False
@@ -134,11 +135,11 @@ for _ in range(n_trials):
 #                pruned_trial = True
 #                break
 #
-#    if pruned_trial:
-#        study.tell(trial, state=optuna.trial.TrialState.PRUNED)  # tell the pruned state
-#    else:
-#        score = clf.score(X_valid, y_valid)
-#        study.tell(trial, score)  # tell objective value
+#        if pruned_trial:
+#            study.tell(trial, state=optuna.trial.TrialState.PRUNED)  # tell the pruned state
+#        else:
+#            score = clf.score(X_valid, y_valid)
+#            study.tell(trial, score)  # tell objective value
 
 ###################################################################################################
 # .. note::
@@ -162,7 +163,7 @@ for _ in range(n_trials):
 # For example,
 
 distributions = {
-    "C": optuna.distributions.LogUniformDistribution(1e-7, 10.0),
+    "C": optuna.distributions.FloatDistribution(1e-7, 10.0, log=True),
     "solver": optuna.distributions.CategoricalDistribution(("lbfgs", "saga")),
 }
 
@@ -196,39 +197,57 @@ for _ in range(n_trials):
 # For example, parallelizable evaluation, operation over vectors, etc.
 
 ###################################################################################################
-# The following objective takes batched hyperparameters ``xs`` instead of a single
-# hyperparameter and calculates the objective over the full vector.
+# The following objective takes batched hyperparameters ``xs`` and ``ys`` instead of a single
+# pair of hyperparameters ``x`` and ``y`` and calculates the objective over the full vectors.
 
 
-def batched_objective(xs: np.ndarray):
-    return xs ** 2 + 1
+def batched_objective(xs: np.ndarray, ys: np.ndarray):
+    return xs**2 + ys
 
 
 ###################################################################################################
-# In the following example, the number of hyperparameters in a batch is :math:`10`,
+# In the following example, the number of pairs of hyperparameters in a batch is :math:`10`,
 # and ``batched_objective`` is evaluated three times.
 # Thus, the number of trials is :math:`30`.
-# Note that you need to store either ``trial_ids`` or ``trial`` to call
+# Note that you need to store either ``trial_numbers`` or ``trial`` to call
 # :func:`optuna.study.Study.tell` method after the batched evaluations.
 
 batch_size = 10
-study = optuna.create_study()
+study = optuna.create_study(sampler=optuna.samplers.CmaEsSampler())
 
 for _ in range(3):
-
     # create batch
-    trial_ids = []
-    samples = []
+    trial_numbers = []
+    x_batch = []
+    y_batch = []
     for _ in range(batch_size):
         trial = study.ask()
-        trial_ids.append(trial.number)
-        x = trial.suggest_int("x", -10, 10)
-        samples.append(x)
+        trial_numbers.append(trial.number)
+        x_batch.append(trial.suggest_float("x", -10, 10))
+        y_batch.append(trial.suggest_float("y", -10, 10))
 
     # evaluate batched objective
-    samples = np.array(samples)
-    objectives = batched_objective(samples)
+    x_batch = np.array(x_batch)
+    y_batch = np.array(y_batch)
+    objectives = batched_objective(x_batch, y_batch)
 
     # finish all trials in the batch
-    for trial_id, objective in zip(trial_ids, objectives):
-        study.tell(trial_id, objective)
+    for trial_number, objective in zip(trial_numbers, objectives):
+        study.tell(trial_number, objective)
+
+###################################################################################################
+# .. tip::
+#
+#     :class:`optuna.samplers.TPESampler` class can take a boolean parameter ``constant_liar``,
+#     which is enabled by default. It penalizes running trials to avoid having multiple workers
+#     evaluating similar parameter configurations during batched optimization. This is especially
+#     beneficial if each objective function evaluation is costly and the durations of the running
+#     states are significant, and/or the number of workers is high.
+
+###################################################################################################
+# .. tip::
+#
+#     :class:`optuna.samplers.CmaEsSampler` class can take a ``popsize`` attribute parameter
+#     used as the initial population size for the CMA-ES algorithm. In the context of batched
+#     optimization, it can  be set equal to a multiple of the batch size in order to benefit from
+#     parallelizable operations.

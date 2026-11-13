@@ -1,65 +1,50 @@
-from collections import OrderedDict
-from typing import Callable
-from typing import List
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-import optuna
-from optuna._experimental import experimental
-from optuna.importance._base import BaseImportanceEvaluator
+from optuna._experimental import experimental_func
 from optuna.logging import get_logger
-from optuna.study import Study
-from optuna.trial import FrozenTrial
-from optuna.trial import TrialState
-from optuna.visualization._utils import _check_plot_args
+from optuna.visualization._param_importances import _get_importances_infos
+from optuna.visualization._param_importances import _ImportancesInfo
 from optuna.visualization.matplotlib._matplotlib_imports import _imports
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from optuna.importance._base import BaseImportanceEvaluator
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
 
 
 if _imports.is_successful():
     from optuna.visualization.matplotlib._matplotlib_imports import Axes
-    from optuna.visualization.matplotlib._matplotlib_imports import cm
+    from optuna.visualization.matplotlib._matplotlib_imports import Figure
     from optuna.visualization.matplotlib._matplotlib_imports import plt
 
 
 _logger = get_logger(__name__)
 
 
-@experimental("2.2.0")
+AXES_PADDING_RATIO = 1.05
+
+
+@experimental_func("2.2.0")
 def plot_param_importances(
     study: Study,
-    evaluator: Optional[BaseImportanceEvaluator] = None,
-    params: Optional[List[str]] = None,
+    evaluator: BaseImportanceEvaluator | None = None,
+    params: list[str] | None = None,
     *,
-    target: Optional[Callable[[FrozenTrial], float]] = None,
+    target: Callable[[FrozenTrial], float] | None = None,
     target_name: str = "Objective Value",
 ) -> "Axes":
-    """Plot hyperparameter importances with Matplotlib.
+    """Plot hyperparameter importances (:class:`~optuna.importance.PedAnovaImportanceEvaluator` by
+    default) with Matplotlib.
 
     .. seealso::
         Please refer to :func:`optuna.visualization.plot_param_importances` for an example.
-
-    Example:
-
-        The following code snippet shows how to plot hyperparameter importances.
-
-        .. plot::
-
-            import optuna
-
-
-            def objective(trial):
-                x = trial.suggest_int("x", 0, 2)
-                y = trial.suggest_float("y", -1.0, 1.0)
-                z = trial.suggest_float("z", 0.0, 1.5)
-                return x ** 2 + y ** 3 - z ** 4
-
-
-            sampler = optuna.samplers.RandomSampler(seed=10)
-            study = optuna.create_study(sampler=sampler)
-            study.optimize(objective, n_trials=100)
-
-            optuna.visualization.matplotlib.plot_param_importances(study)
 
     Args:
         study:
@@ -67,76 +52,94 @@ def plot_param_importances(
         evaluator:
             An importance evaluator object that specifies which algorithm to base the importance
             assessment on.
-            Defaults to
-            :class:`~optuna.importance.FanovaImportanceEvaluator`.
+            Defaults to :class:`~optuna.importance.PedAnovaImportanceEvaluator`.
+            For details on this evaluator, please refer to the following papers:
+
+            - `PED-ANOVA: Efficiently Quantifying Hyperparameter Importance in Arbitrary Subspaces
+              <https://arxiv.org/abs/2304.10255>`__ (IJCAI 2023)
+            - `Conditional PED-ANOVA: Hyperparameter Importance in Hierarchical & Dynamic Search
+              Spaces <https://arxiv.org/abs/2601.20800>`__ (KDD 2026)
+
+            When using this evaluator in your project, please consider citing both papers.
+
         params:
             A list of names of parameters to assess.
-            If :obj:`None`, all parameters that are present in all of the completed trials are
-            assessed.
+            If :obj:`None`, :class:`~optuna.importance.PedAnovaImportanceEvaluator` assesses all
+            parameters that appear in completed trials, including conditional parameters, while
+            other evaluators assess parameters present in all completed trials.
+            If specified, only the specified parameters are assessed.
+            When using :class:`~optuna.importance.PedAnovaImportanceEvaluator`, each specified
+            parameter must appear in at least one completed trial.
+            When using other evaluators, at least one completed trial must contain all specified
+            parameters.
         target:
-            A function to specify the value to display. If it is :obj:`None` and ``study`` is being
-            used for single-objective optimization, the objective values are plotted.
-
-            .. note::
-                Specify this argument if ``study`` is being used for multi-objective
-                optimization. For example, to get the hyperparameter importance of the first
-                objective, use ``target=lambda t: t.values[0]`` for the target parameter.
+            A function that returns the value used to evaluate and display importances.
+            If :obj:`None`, objective values are used for single-objective optimization.
+            For multi-objective optimization, all objectives will be plotted if ``target`` is
+            :obj:`None`. Specify ``target``, for example ``target=lambda t: t.values[0]``, to
+            plot importances for a specific objective.
         target_name:
-            Target's name to display on the axis label.
+            Target's name to display on the axis label. Names set via
+            :meth:`~optuna.study.Study.set_metric_names` will be used if ``target`` is :obj:`None`,
+            overriding this argument.
 
     Returns:
         A :class:`matplotlib.axes.Axes` object.
-
-    Raises:
-        :exc:`ValueError`:
-            If ``target`` is :obj:`None` and ``study`` is being used for multi-objective
-            optimization.
     """
 
     _imports.check()
-    _check_plot_args(study, target, target_name)
-    return _get_param_importance_plot(study, evaluator, params, target, target_name)
+    importances_infos = _get_importances_infos(study, evaluator, params, target, target_name)
+    return _get_importances_plot(importances_infos)
 
 
-def _get_param_importance_plot(
-    study: Study,
-    evaluator: Optional[BaseImportanceEvaluator] = None,
-    params: Optional[List[str]] = None,
-    target: Optional[Callable[[FrozenTrial], float]] = None,
-    target_name: str = "Objective Value",
-) -> "Axes":
-
+def _get_importances_plot(infos: tuple[_ImportancesInfo, ...]) -> "Axes":
     # Set up the graph style.
-    _, ax = plt.subplots()
     plt.style.use("ggplot")  # Use ggplot style sheet for similar outputs to plotly.
-    ax.set_title("Hyperparameter Importances")
-    ax.set_xlabel(f"Importance for {target_name}")
+    fig, ax = plt.subplots()
+    ax.set_title("Hyperparameter Importances", loc="left")
+    ax.set_xlabel("Hyperparameter Importance")
     ax.set_ylabel("Hyperparameter")
+    height = 0.8 / len(infos)  # Default height split between objectives.
 
-    # Prepare data for plotting.
-    # Importances cannot be evaluated without completed trials.
-    # Return an empty figure for consistency with other visualization functions.
-    trials = [trial for trial in study.trials if trial.state == TrialState.COMPLETE]
-    if len(trials) == 0:
-        _logger.warning("Study instance does not contain completed trials.")
-        return ax
+    for objective_id, info in enumerate(infos):
+        param_names = info.param_names
+        pos = np.arange(len(param_names))
+        offset = height * objective_id
+        importance_values = info.importance_values
 
-    importances = optuna.importance.get_param_importances(
-        study, evaluator=evaluator, params=params, target=target
-    )
+        if not importance_values:
+            continue
 
-    importances = OrderedDict(reversed(list(importances.items())))
-    importance_values = list(importances.values())
-    param_names = list(importances.keys())
-    pos = np.arange(len(param_names))
+        # Draw horizontal bars.
+        ax.barh(
+            pos + offset,
+            importance_values,
+            height=height,
+            align="center",
+            label=info.target_name,
+            color=plt.get_cmap("tab20c")(objective_id),
+        )
 
-    # Draw horizontal bars.
-    ax.barh(
-        pos,
-        importance_values,
-        align="center",
-        color=cm.get_cmap("tab20c")(0),
-        tick_label=param_names,
-    )
+        _set_bar_labels(info, fig, ax, offset)
+        ax.set_yticks(pos + offset / 2, param_names)
 
+    ax.legend(loc="best")
     return ax
+
+
+def _set_bar_labels(info: _ImportancesInfo, fig: "Figure", ax: "Axes", offset: float) -> None:
+    # Figure canvas does not necessarily have a get_renderer.
+    assert hasattr(fig.canvas, "get_renderer")
+    renderer = fig.canvas.get_renderer()
+    for idx, (val, label) in enumerate(zip(info.importance_values, info.importance_labels)):
+        text = ax.text(val, idx + offset, label, va="center")
+
+        # Sometimes horizontal axis needs to be re-scaled
+        # to avoid text going over plot area.
+        bbox = text.get_window_extent(renderer)
+        bbox = bbox.transformed(ax.transData.inverted())
+        _, plot_xmax = ax.get_xlim()
+        bbox_xmax = bbox.xmax
+
+        if bbox_xmax > plot_xmax:
+            ax.set_xlim(xmax=AXES_PADDING_RATIO * bbox_xmax)

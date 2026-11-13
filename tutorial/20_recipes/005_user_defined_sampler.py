@@ -1,5 +1,5 @@
 """
-.. _sampler:
+.. _user_defined_sampler:
 
 User-Defined Sampler
 ====================
@@ -8,7 +8,7 @@ Thanks to user-defined samplers, you can:
 
 - experiment your own sampling algorithms,
 - implement task-specific algorithms to refine the optimization performance, or
-- wrap other optimization libraries to integrate them into Optuna pipelines (e.g., :class:`~optuna.integration.SkoptSampler`).
+- wrap other optimization libraries to integrate them into Optuna pipelines (e.g., `BoTorchSampler <https://optuna-integration.readthedocs.io/en/stable/reference/generated/optuna_integration.BoTorchSampler.html>`__).
 
 This section describes the internal behavior of sampler classes and shows an example of implementing a user-defined sampler.
 
@@ -17,7 +17,7 @@ Overview of Sampler
 -------------------
 
 A sampler has the responsibility to determine the parameter values to be evaluated in a trial.
-When a `suggest` API (e.g., :func:`~optuna.trial.Trial.suggest_float`) is called inside an objective function, the corresponding distribution object (e.g., :class:`~optuna.distributions.UniformDistribution`) is created internally. A sampler samples a parameter value from the distribution. The sampled value is returned to the caller of the `suggest` API and evaluated in the objective function.
+When a `suggest` API (e.g., :func:`~optuna.trial.Trial.suggest_float`) is called inside an objective function, the corresponding distribution object (e.g., :class:`~optuna.distributions.FloatDistribution`) is created internally. A sampler samples a parameter value from the distribution. The sampled value is returned to the caller of the `suggest` API and evaluated in the objective function.
 
 To create a new sampler, you need to define a class that inherits :class:`~optuna.samplers.BaseSampler`.
 The base class has three abstract methods;
@@ -37,7 +37,7 @@ An Example: Implementing SimulatedAnnealingSampler
 --------------------------------------------------
 
 For example, the following code defines a sampler based on
-`Simulated Annealing (SA) <https://en.wikipedia.org/wiki/Simulated_annealing>`_:
+`Simulated Annealing (SA) <https://en.wikipedia.org/wiki/Simulated_annealing>`__:
 """
 
 import numpy as np
@@ -74,8 +74,15 @@ class SimulatedAnnealingSampler(optuna.samplers.BaseSampler):
         # the objective function passed to the study.
         params = {}
         for param_name, param_distribution in search_space.items():
-            if not isinstance(param_distribution, optuna.distributions.UniformDistribution):
-                raise NotImplementedError("Only suggest_float() is supported")
+            if (
+                not isinstance(param_distribution, optuna.distributions.FloatDistribution)
+                or (param_distribution.step is not None and param_distribution.step != 1)
+                or param_distribution.log
+            ):
+                msg = (
+                    "Only suggest_float() with `step` `None` or 1.0 and `log` `False` is supported"
+                )
+                raise NotImplementedError(msg)
 
             current_value = self._current_trial.params[param_name]
             width = (param_distribution.high - param_distribution.low) * 0.1
@@ -87,7 +94,7 @@ class SimulatedAnnealingSampler(optuna.samplers.BaseSampler):
 
     # The rest are unrelated to SA algorithm: boilerplate
     def infer_relative_search_space(self, study, trial):
-        return optuna.samplers.intersection_search_space(study)
+        return optuna.search_space.intersection_search_space(study.get_trials(deepcopy=False))
 
     def sample_independent(self, study, trial, param_name, param_distribution):
         independent_sampler = optuna.samplers.RandomSampler()
@@ -99,7 +106,7 @@ class SimulatedAnnealingSampler(optuna.samplers.BaseSampler):
 #    In favor of code simplicity, the above implementation doesn't support some features (e.g., maximization).
 #    If you're interested in how to support those features, please see
 #    `examples/samplers/simulated_annealing.py
-#    <https://github.com/optuna/optuna/blob/master/examples/samplers/simulated_annealing_sampler.py>`_.
+#    <https://github.com/optuna/optuna-examples/blob/main/samplers/simulated_annealing_sampler.py>`__.
 #
 #
 # You can use ``SimulatedAnnealingSampler`` in the same way as built-in samplers as follows:
@@ -108,7 +115,7 @@ class SimulatedAnnealingSampler(optuna.samplers.BaseSampler):
 def objective(trial):
     x = trial.suggest_float("x", -10, 10)
     y = trial.suggest_float("y", -5, 5)
-    return x ** 2 + y
+    return x**2 + y
 
 
 sampler = SimulatedAnnealingSampler()
@@ -127,6 +134,6 @@ print("Parameters that achieve the best value: ", best_trial.params)
 # .. note::
 #     Strictly speaking, in the first trial,
 #     ``SimulatedAnnealingSampler.sample_independent`` method is used to sample parameter values.
-#     Because :func:`~optuna.samplers.intersection_search_space` used in
+#     Because :func:`~optuna.search_space.intersection_search_space` used in
 #     ``SimulatedAnnealingSampler.infer_relative_search_space`` cannot infer the search space
 #     if there are no complete trials.

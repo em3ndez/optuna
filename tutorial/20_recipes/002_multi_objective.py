@@ -7,14 +7,22 @@ Multi-objective Optimization with Optuna
 This tutorial showcases Optuna's multi-objective optimization feature by
 optimizing the validation accuracy of Fashion MNIST dataset and the FLOPS of the model implemented in PyTorch.
 
-We use `thop <https://github.com/Lyken17/pytorch-OpCounter>`_ to measure FLOPS.
+We use `fvcore <https://github.com/facebookresearch/fvcore>`__ to measure FLOPS.
+
+Note that when optimizing many objectives, a large fraction of trials may become non-dominated
+due to the curse of dimensionality in the objective space. If possible, consider modeling some
+objectives as constraints. Constraints can be set within the objective function using
+:meth:`~optuna.trial.Trial.set_constraint` method. Currently, `NSGAIISampler`, `NSGAIIISampler`,
+`TPESampler`, and `GPSampler` support constrained multi-objective optimization.
+Since Bayesian optimization is often sample efficient, use :class:`~optuna.samplers.TPESampler`,
+or :class:`~optuna.samplers.GPSampler` for ``n_trials < 1000``.
 """
 
-import thop
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from fvcore.nn import FlopCountAnalysis
 
 import optuna
 
@@ -32,10 +40,10 @@ def define_model(trial):
 
     in_features = 28 * 28
     for i in range(n_layers):
-        out_features = trial.suggest_int("n_units_l{}".format(i), 4, 128)
+        out_features = trial.suggest_int(f"n_units_l{i}", 4, 128)
         layers.append(nn.Linear(in_features, out_features))
         layers.append(nn.ReLU())
-        p = trial.suggest_float("dropout_{}".format(i), 0.2, 0.5)
+        p = trial.suggest_float(f"dropout_{i}", 0.2, 0.5)
         layers.append(nn.Dropout(p))
 
         in_features = out_features
@@ -67,7 +75,7 @@ def eval_model(model, valid_loader):
 
     accuracy = correct / N_VALID_EXAMPLES
 
-    flops, _ = thop.profile(model, inputs=(torch.randn(1, 28 * 28).to(DEVICE),), verbose=False)
+    flops = FlopCountAnalysis(model, inputs=(torch.randn(1, 28 * 28).to(DEVICE),)).total()
     return flops, accuracy
 
 
@@ -119,9 +127,29 @@ print("Number of finished trials: ", len(study.trials))
 
 
 ###################################################################################################
-# Check trials on pareto front visually
+# Note that the following sections requires the installation of `Plotly <https://plotly.com/python>`__ for visualization:
+#
+# .. code-block:: console
+#
+#     $ pip install plotly
+#     $ pip install nbformat  # Required if you are running this tutorial in Jupyter Notebook.
+#
+# Check trials on Pareto front visually.
 optuna.visualization.plot_pareto_front(study, target_names=["FLOPS", "accuracy"])
 
+
+###################################################################################################
+# Fetch the list of trials on the Pareto front with :attr:`~optuna.study.Study.best_trials`.
+#
+# For example, the following code shows the number of trials on the Pareto front and picks the trial with the highest accuracy.
+
+print(f"Number of trials on the Pareto front: {len(study.best_trials)}")
+
+trial_with_highest_accuracy = max(study.best_trials, key=lambda t: t.values[1])
+print("Trial with highest accuracy: ")
+print(f"\tnumber: {trial_with_highest_accuracy.number}")
+print(f"\tparams: {trial_with_highest_accuracy.params}")
+print(f"\tvalues: {trial_with_highest_accuracy.values}")
 
 ###################################################################################################
 # Learn which hyperparameters are affecting the flops most with hyperparameter importance.

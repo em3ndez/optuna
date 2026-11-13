@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import math
 from typing import Any
-from typing import Optional
+from typing import TYPE_CHECKING
 
-import optuna
 from optuna.pruners import BasePruner
 from optuna.pruners._percentile import _is_first_in_interval_step
+
+
+if TYPE_CHECKING:
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
 
 
 def _check_value(value: Any) -> float:
@@ -12,8 +18,8 @@ def _check_value(value: Any) -> float:
         # For convenience, we allow users to report a value that can be cast to `float`.
         value = float(value)
     except (TypeError, ValueError):
-        message = "The `value` argument is of type '{}' but supposed to be a float.".format(
-            type(value).__name__
+        message = (
+            f"The `value` argument is of type '{type(value).__name__}' but supposed to be a float."
         )
         raise TypeError(message) from None
 
@@ -61,7 +67,7 @@ class ThresholdPruner(BasePruner):
             study = create_study(pruner=ThresholdPruner(lower=0.0))
             study.optimize(objective_for_lower, n_trials=10)
 
-    Args
+    Args:
         lower:
             A minimum value which determines whether pruner prunes or not.
             If an intermediate value is smaller than lower, it prunes.
@@ -79,12 +85,11 @@ class ThresholdPruner(BasePruner):
 
     def __init__(
         self,
-        lower: Optional[float] = None,
-        upper: Optional[float] = None,
+        lower: float | None = None,
+        upper: float | None = None,
         n_warmup_steps: int = 0,
         interval_steps: int = 1,
     ) -> None:
-
         if lower is None and upper is None:
             raise TypeError("Either lower or upper must be specified.")
         if lower is not None:
@@ -99,11 +104,11 @@ class ThresholdPruner(BasePruner):
             raise ValueError("lower should be smaller than upper.")
         if n_warmup_steps < 0:
             raise ValueError(
-                "Number of warmup steps cannot be negative but got {}.".format(n_warmup_steps)
+                f"Number of warmup steps cannot be negative but got {n_warmup_steps}."
             )
         if interval_steps < 1:
             raise ValueError(
-                "Pruning interval steps must be at least 1 but got {}.".format(interval_steps)
+                f"Pruning interval steps must be at least 1 but got {interval_steps}."
             )
 
         self._lower = lower
@@ -111,8 +116,7 @@ class ThresholdPruner(BasePruner):
         self._n_warmup_steps = n_warmup_steps
         self._interval_steps = interval_steps
 
-    def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
-
+    def prune(self, study: Study, trial: FrozenTrial) -> bool:
         step = trial.last_step
         if step is None:
             return False

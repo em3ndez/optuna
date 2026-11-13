@@ -36,15 +36,8 @@ var/
 .installed.cfg
 *.egg
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# uv
+uv.lock
 
 # Unit test / coverage reports
 htmlcov/
@@ -64,6 +57,7 @@ coverage.xml
 
 # Django stuff:
 *.log
+!tests/storages_tests/journal_tests/assets/*.log
 local_settings.py
 
 # Flask stuff:
@@ -89,6 +83,7 @@ celerybeat-schedule
 .env
 
 # virtualenv
+.venv/
 venv/
 ENV/
 
@@ -105,14 +100,29 @@ ENV/
 .vscode
 .devcontainer
 
+# ruff
+.ruff_cache
+
 # MyPy
 .mypy_cache
 
 # Sphinx
 tutorial/**/example.db
 tutorial/**/example-study.db
+tutorial/20_recipes/artifacts/
+tutorial/20_recipes/best_atoms.png
+tutorial/20_recipes/tmp/
 docs/_build/
 docs/source/reference/generated/
-docs/source/reference/multi_objective/generated/
 docs/source/reference/visualization/generated/
-docs/source/tutorial/
+docs/source/reference/visualization/matplotlib/generated/
+docs/source/reference/samplers/generated
+docs/source/sg_execution_times.rst
+docs/source/tutorial/**
+!docs/source/tutorial/index.rst
+
+# Dask
+dask-worker-space/
+
+# PyTorch Lightning
+lightning_logs/

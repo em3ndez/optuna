@@ -1,44 +1,55 @@
+from __future__ import annotations
+
 import logging
-from logging import CRITICAL  # NOQA
-from logging import DEBUG  # NOQA
-from logging import ERROR  # NOQA
-from logging import FATAL  # NOQA
-from logging import INFO  # NOQA
-from logging import WARN  # NOQA
-from logging import WARNING  # NOQA
+from logging import CRITICAL
+from logging import DEBUG
+from logging import ERROR
+from logging import FATAL
+from logging import INFO
+from logging import WARN
+from logging import WARNING
+import sys
 import threading
-from typing import Optional
 
 import colorlog
 
 
+__all__ = [
+    "CRITICAL",
+    "DEBUG",
+    "ERROR",
+    "FATAL",
+    "INFO",
+    "WARN",
+    "WARNING",
+]
+
 _lock: threading.Lock = threading.Lock()
-_default_handler: Optional[logging.Handler] = None
+_default_handler: logging.Handler | None = None
 
 
-def create_default_formatter() -> colorlog.ColoredFormatter:
+def create_default_formatter() -> logging.Formatter:
     """Create a default formatter of log messages.
 
     This function is not supposed to be directly accessed by library users.
     """
-
-    return colorlog.ColoredFormatter(
-        "%(log_color)s[%(levelname)1.1s %(asctime)s]%(reset)s %(message)s"
+    header = "[%(levelname)1.1s %(asctime)s]"
+    message = "%(message)s"
+    return colorlog.TTYColoredFormatter(
+        f"%(log_color)s{header}%(reset)s {message}",
+        stream=sys.stderr,
     )
 
 
 def _get_library_name() -> str:
-
     return __name__.split(".")[0]
 
 
 def _get_library_root_logger() -> logging.Logger:
-
     return logging.getLogger(_get_library_name())
 
 
 def _configure_library_root_logger() -> None:
-
     global _default_handler
 
     with _lock:
@@ -56,7 +67,6 @@ def _configure_library_root_logger() -> None:
 
 
 def _reset_library_root_logger() -> None:
-
     global _default_handler
 
     with _lock:
@@ -82,6 +92,40 @@ def get_logger(name: str) -> logging.Logger:
 def get_verbosity() -> int:
     """Return the current level for the Optuna's root logger.
 
+    Example:
+
+        Get the default verbosity level.
+
+        .. testsetup::
+
+            def objective(trial):
+                x = trial.suggest_float("x", -100, 100)
+                y = trial.suggest_categorical("y", [-1, 0, 1])
+                return x**2 + y
+
+        .. testcode::
+
+            import optuna
+
+            # The default verbosity level of Optuna is `optuna.logging.INFO`.
+            print(optuna.logging.get_verbosity())
+            # 20
+            print(optuna.logging.INFO)
+            # 20
+
+            # There are logs of the INFO level.
+            study = optuna.create_study()
+            study.optimize(objective, n_trials=5)
+            # [I 2021-10-31 05:35:17,232] A new study created ...
+            # [I 2021-10-31 05:35:17,238] Trial 0 finished with value: ...
+            # [I 2021-10-31 05:35:17,245] Trial 1 finished with value: ...
+            # ...
+
+        .. testoutput::
+           :hide:
+
+           20
+           20
     Returns:
         Logging level, e.g., ``optuna.logging.DEBUG`` and ``optuna.logging.INFO``.
 
@@ -101,6 +145,36 @@ def get_verbosity() -> int:
 
 def set_verbosity(verbosity: int) -> None:
     """Set the level for the Optuna's root logger.
+
+    Example:
+
+        Set the logging level ``optuna.logging.WARNING``.
+
+        .. testsetup::
+
+            def objective(trial):
+                x = trial.suggest_int("x", -10, 10)
+                return x**2
+
+        .. testcode::
+
+            import optuna
+
+            # There are INFO level logs.
+            study = optuna.create_study()
+            study.optimize(objective, n_trials=10)
+            # [I 2021-10-31 02:59:35,088] Trial 0 finished with value: 16.0 ...
+            # [I 2021-10-31 02:59:35,091] Trial 1 finished with value: 1.0 ...
+            # [I 2021-10-31 02:59:35,096] Trial 2 finished with value: 1.0 ...
+
+            # Setting the logging level WARNING, the INFO logs are suppressed.
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            study.optimize(objective, n_trials=10)
+
+        .. testcleanup::
+
+            optuna.logging.set_verbosity(optuna.logging.INFO)
+
 
     Args:
         verbosity:
@@ -132,7 +206,7 @@ def disable_default_handler() -> None:
             def objective(trial):
                 x = trial.suggest_float("x", -100, 100)
                 y = trial.suggest_categorical("y", [-1, 0, 1])
-                return x ** 2 + y
+                return x**2 + y
 
         .. testcode::
 
@@ -175,7 +249,7 @@ def disable_propagation() -> None:
     """Disable propagation of the library log outputs.
 
     Note that log propagation is disabled by default. You only need to use this function
-    to stop log propagation when you use :func:`~optuna.logging.enable_propogation()`.
+    to stop log propagation when you use :func:`~optuna.logging.enable_propagation()`.
 
     Example:
 
@@ -186,7 +260,7 @@ def disable_propagation() -> None:
             def objective(trial):
                 x = trial.suggest_float("x", -100, 100)
                 y = trial.suggest_categorical("y", [-1, 0, 1])
-                return x ** 2 + y
+                return x**2 + y
 
         .. testcode::
 
@@ -206,7 +280,7 @@ def disable_propagation() -> None:
             logger.info("Logs from first optimize call")  # The logs are saved in the logs file.
             study.optimize(objective, n_trials=10)
 
-            optuna.logging.disable_propagation()  # Stop propogating logs to the root logger.
+            optuna.logging.disable_propagation()  # Stop propagating logs to the root logger.
 
             logger.info("Logs from second optimize call")
             # The new logs for second optimize call are not saved.
@@ -239,7 +313,7 @@ def enable_propagation() -> None:
             def objective(trial):
                 x = trial.suggest_float("x", -100, 100)
                 y = trial.suggest_categorical("y", [-1, 0, 1])
-                return x ** 2 + y
+                return x**2 + y
 
         .. testcode::
 

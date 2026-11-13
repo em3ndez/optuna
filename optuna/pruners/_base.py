@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import abc
+from typing import TYPE_CHECKING
 
-import optuna
+
+if TYPE_CHECKING:
+    import optuna
 
 
-class BasePruner(object, metaclass=abc.ABCMeta):
+class BasePruner(abc.ABC):
     """Base class for pruners."""
 
     @abc.abstractmethod

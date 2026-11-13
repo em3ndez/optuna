@@ -1,28 +1,30 @@
-import math
-from typing import List
-from typing import Optional
-from typing import Union
+from __future__ import annotations
 
-import optuna
-from optuna._study_direction import StudyDirection
+import math
+from typing import TYPE_CHECKING
+
 from optuna.pruners._base import BasePruner
+from optuna.study._study_direction import StudyDirection
 from optuna.trial._state import TrialState
+
+
+if TYPE_CHECKING:
+    import optuna
 
 
 class SuccessiveHalvingPruner(BasePruner):
     """Pruner using Asynchronous Successive Halving Algorithm.
 
-    `Successive Halving <https://arxiv.org/abs/1502.07943>`_ is a bandit-based algorithm to
-    identify the best one among multiple configurations. This class implements an asynchronous
-    version of Successive Halving. Please refer to the paper of
-    `Asynchronous Successive Halving <http://arxiv.org/abs/1810.05934>`_ for detailed descriptions.
+    `Successive Halving <https://proceedings.mlr.press/v51/jamieson16.html>`__ is a bandit-based
+    algorithm to identify the best one among multiple configurations. This class implements an
+    asynchronous version of Successive Halving. Please refer to the paper of
+    `Asynchronous Successive Halving <https://proceedings.mlsys.org/paper_files/paper/2020/file/
+    a06f20b349c6cf09a6b171c71b88bbfc-Paper.pdf>`__ for detailed descriptions.
 
     Note that, this class does not take care of the parameter for the maximum
     resource, referred to as :math:`R` in the paper. The maximum resource allocated to a trial is
     typically limited inside the objective function (e.g., ``step`` number in `simple_pruning.py
-    <https://github.com/optuna/optuna/blob/master/examples/simple_pruning.py#L35>`_,
-    ``EPOCH`` number in `chainer_integration.py
-    <https://github.com/optuna/optuna/blob/master/examples/chainer/chainer_integration.py#L77>`_).
+    <https://github.com/optuna/optuna-examples/blob/main/basic/pruning.py>`__).
 
     .. seealso::
         Please refer to :meth:`~optuna.trial.Trial.report`.
@@ -70,8 +72,9 @@ class SuccessiveHalvingPruner(BasePruner):
     Args:
         min_resource:
             A parameter for specifying the minimum resource allocated to a trial
-            (in the `paper <http://arxiv.org/abs/1810.05934>`_ this parameter is
-            referred to as :math:`r`).
+            (in the `paper <https://proceedings.mlsys.org/paper_files/paper/2020/file/
+            a06f20b349c6cf09a6b171c71b88bbfc-Paper.pdf>`__ this parameter is referred to as
+            :math:`r`).
             This parameter defaults to 'auto' where the value is determined based on a heuristic
             that looks at the number of required steps for the first trial to complete.
 
@@ -96,13 +99,15 @@ class SuccessiveHalvingPruner(BasePruner):
                 manually specify the minimum possible step to ``min_resource``.
         reduction_factor:
             A parameter for specifying reduction factor of promotable trials
-            (in the `paper <http://arxiv.org/abs/1810.05934>`_ this parameter is
+            (in the `paper <https://proceedings.mlsys.org/paper_files/paper/2020/file/
+            a06f20b349c6cf09a6b171c71b88bbfc-Paper.pdf>`__ this parameter is
             referred to as :math:`\\eta`).  At the completion point of each rung,
             about :math:`{1 \\over \\mathsf{reduction}\\_\\mathsf{factor}}`
             trials will be promoted.
         min_early_stopping_rate:
             A parameter for specifying the minimum early-stopping rate
-            (in the `paper <http://arxiv.org/abs/1810.05934>`_ this parameter is
+            (in the `paper <https://proceedings.mlsys.org/paper_files/paper/2020/file/
+            a06f20b349c6cf09a6b171c71b88bbfc-Paper.pdf>`__ this parameter is
             referred to as :math:`s`).
         bootstrap_count:
             Minimum number of trials that need to complete a rung before any trial
@@ -111,49 +116,48 @@ class SuccessiveHalvingPruner(BasePruner):
 
     def __init__(
         self,
-        min_resource: Union[str, int] = "auto",
+        min_resource: str | int = "auto",
         reduction_factor: int = 4,
         min_early_stopping_rate: int = 0,
         bootstrap_count: int = 0,
     ) -> None:
-
         if isinstance(min_resource, str) and min_resource != "auto":
             raise ValueError(
-                "The value of `min_resource` is {}, "
-                "but must be either `min_resource` >= 1 or 'auto'".format(min_resource)
+                f"The value of `min_resource` is {min_resource}, "
+                "but must be either `min_resource` >= 1 or 'auto'"
             )
 
         if isinstance(min_resource, int) and min_resource < 1:
             raise ValueError(
-                "The value of `min_resource` is {}, "
-                "but must be either `min_resource >= 1` or 'auto'".format(min_resource)
+                f"The value of `min_resource` is {min_resource}, "
+                "but must be either `min_resource >= 1` or 'auto'"
             )
 
         if reduction_factor < 2:
             raise ValueError(
-                "The value of `reduction_factor` is {}, "
-                "but must be `reduction_factor >= 2`".format(reduction_factor)
+                f"The value of `reduction_factor` is {reduction_factor}, "
+                "but must be `reduction_factor >= 2`"
             )
 
         if min_early_stopping_rate < 0:
             raise ValueError(
-                "The value of `min_early_stopping_rate` is {}, "
-                "but must be `min_early_stopping_rate >= 0`".format(min_early_stopping_rate)
+                f"The value of `min_early_stopping_rate` is {min_early_stopping_rate}, "
+                "but must be `min_early_stopping_rate >= 0`"
             )
 
         if bootstrap_count < 0:
             raise ValueError(
-                "The value of `bootstrap_count` is {}, "
-                "but must be `bootstrap_count >= 0`".format(bootstrap_count)
+                "The value of `bootstrap_count` is "
+                f"{bootstrap_count}, but must be `bootstrap_count >= 0`"
             )
 
         if bootstrap_count > 0 and min_resource == "auto":
             raise ValueError(
                 "bootstrap_count > 0 and min_resource == 'auto' "
-                "are mutually incompatible, bootstrap_count is {}".format(bootstrap_count)
+                f"are mutually incompatible, bootstrap_count is {bootstrap_count}"
             )
 
-        self._min_resource: Optional[int] = None
+        self._min_resource: int | None = None
         if isinstance(min_resource, int):
             self._min_resource = min_resource
         self._reduction_factor = reduction_factor
@@ -161,14 +165,13 @@ class SuccessiveHalvingPruner(BasePruner):
         self._bootstrap_count = bootstrap_count
 
     def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
-
         step = trial.last_step
         if step is None:
             return False
 
         rung = _get_current_rung(trial)
         value = trial.intermediate_values[step]
-        trials: Optional[List["optuna.trial.FrozenTrial"]] = None
+        trials: list["optuna.trial.FrozenTrial"] | None = None
 
         while True:
             if self._min_resource is None:
@@ -213,8 +216,7 @@ class SuccessiveHalvingPruner(BasePruner):
             rung += 1
 
 
-def _estimate_min_resource(trials: List["optuna.trial.FrozenTrial"]) -> Optional[int]:
-
+def _estimate_min_resource(trials: list["optuna.trial.FrozenTrial"]) -> int | None:
     n_steps = [
         t.last_step for t in trials if t.state == TrialState.COMPLETE and t.last_step is not None
     ]
@@ -228,7 +230,6 @@ def _estimate_min_resource(trials: List["optuna.trial.FrozenTrial"]) -> Optional
 
 
 def _get_current_rung(trial: "optuna.trial.FrozenTrial") -> int:
-
     # The following loop takes `O(log step)` iterations.
     rung = 0
     while _completed_rung_key(rung) in trial.system_attrs:
@@ -237,14 +238,12 @@ def _get_current_rung(trial: "optuna.trial.FrozenTrial") -> int:
 
 
 def _completed_rung_key(rung: int) -> str:
-
-    return "completed_rung_{}".format(rung)
+    return f"completed_rung_{rung}"
 
 
 def _get_competing_values(
-    trials: List["optuna.trial.FrozenTrial"], value: float, rung_key: str
-) -> List[float]:
-
+    trials: list["optuna.trial.FrozenTrial"], value: float, rung_key: str
+) -> list[float]:
     competing_values = [t.system_attrs[rung_key] for t in trials if rung_key in t.system_attrs]
     competing_values.append(value)
     return competing_values
@@ -252,11 +251,10 @@ def _get_competing_values(
 
 def _is_trial_promotable_to_next_rung(
     value: float,
-    competing_values: List[float],
+    competing_values: list[float],
     reduction_factor: int,
     study_direction: StudyDirection,
 ) -> bool:
-
     promotable_idx = (len(competing_values) // reduction_factor) - 1
 
     if promotable_idx == -1:

@@ -1,16 +1,22 @@
-from typing import List
+from __future__ import annotations
 
-from optuna._experimental import experimental
+from typing import TYPE_CHECKING
+
+from optuna._experimental import experimental_func
 from optuna.distributions import CategoricalDistribution
-from optuna.distributions import LogUniformDistribution
-from optuna.trial import FrozenTrial
+from optuna.distributions import FloatDistribution
+from optuna.distributions import IntDistribution
 from optuna.visualization.matplotlib import _matplotlib_imports
+
+
+if TYPE_CHECKING:
+    from optuna.trial import FrozenTrial
 
 
 __all__ = ["is_available"]
 
 
-@experimental("2.2.0")
+@experimental_func("2.2.0")
 def is_available() -> bool:
     """Returns whether visualization with Matplotlib is available or not.
 
@@ -28,19 +34,30 @@ def is_available() -> bool:
     return _matplotlib_imports._imports.is_successful()
 
 
-def _is_log_scale(trials: List[FrozenTrial], param: str) -> bool:
+def _is_log_scale(trials: list[FrozenTrial], param: str) -> bool:
+    for trial in trials:
+        if param in trial.params:
+            dist = trial.distributions[param]
 
+            if isinstance(dist, (FloatDistribution, IntDistribution)):
+                if dist.log:
+                    return True
+
+    return False
+
+
+def _is_categorical(trials: list[FrozenTrial], param: str) -> bool:
     return any(
-        isinstance(t.distributions[param], LogUniformDistribution)
+        isinstance(t.distributions[param], CategoricalDistribution)
         for t in trials
         if param in t.params
     )
 
 
-def _is_categorical(trials: List[FrozenTrial], param: str) -> bool:
-
-    return any(
-        isinstance(t.distributions[param], CategoricalDistribution)
+def _is_numerical(trials: list[FrozenTrial], param: str) -> bool:
+    return all(
+        (isinstance(t.params[param], int) or isinstance(t.params[param], float))
+        and not isinstance(t.params[param], bool)
         for t in trials
         if param in t.params
     )

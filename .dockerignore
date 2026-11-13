@@ -1,9 +1,0 @@
-# Ignore everything
-**
-
-!setup.py
-!README.md
-!optuna
-!examples
-
-**/__pycache__

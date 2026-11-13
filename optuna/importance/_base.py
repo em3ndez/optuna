@@ -1,28 +1,36 @@
-import abc
-from collections import OrderedDict
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
+from __future__ import annotations
 
-from optuna.distributions import BaseDistribution
-from optuna.samplers import intersection_search_space
-from optuna.study import Study
-from optuna.trial import FrozenTrial
+import abc
+from typing import cast
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from optuna.search_space import intersection_search_space
 from optuna.trial import TrialState
 
 
-class BaseImportanceEvaluator(object, metaclass=abc.ABCMeta):
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Collection
+
+    from optuna._transform import _SearchSpaceTransform
+    from optuna.distributions import BaseDistribution
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
+
+
+class BaseImportanceEvaluator(abc.ABC):
     """Abstract parameter importance evaluator."""
 
     @abc.abstractmethod
     def evaluate(
         self,
         study: Study,
-        params: Optional[List[str]] = None,
+        params: list[str] | None = None,
         *,
-        target: Optional[Callable[[FrozenTrial], float]] = None,
-    ) -> Dict[str, float]:
+        target: Callable[[FrozenTrial], float] | None = None,
+    ) -> dict[str, float]:
         """Evaluate parameter importances based on completed trials in the given study.
 
         .. note::
@@ -53,23 +61,20 @@ class BaseImportanceEvaluator(object, metaclass=abc.ABCMeta):
                     objective, use ``target=lambda t: t.values[0]`` for the target parameter.
 
         Returns:
-            An :class:`collections.OrderedDict` where the keys are parameter names and the values
-            are assessed importances.
+            A :obj:`dict` where the keys are parameter names and the values are assessed
+            importances.
 
-        Raises:
-            :exc:`ValueError`:
-                If ``target`` is :obj:`None` and ``study`` is being used for multi-objective
-                optimization.
         """
         # TODO(hvy): Reconsider the interface as logic might violate DRY among multiple evaluators.
         raise NotImplementedError
 
 
-def _get_distributions(study: Study, params: Optional[List[str]]) -> Dict[str, BaseDistribution]:
-    _check_evaluate_args(study, params)
+def _get_distributions(study: Study, params: list[str] | None) -> dict[str, BaseDistribution]:
+    completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+    _check_evaluate_args(completed_trials, params)
 
     if params is None:
-        return intersection_search_space(study, ordered_dict=True)
+        return intersection_search_space(study.get_trials(deepcopy=False))
 
     # New temporary required to pass mypy. Seems like a bug.
     params_not_none = params
@@ -77,10 +82,7 @@ def _get_distributions(study: Study, params: Optional[List[str]]) -> Dict[str, B
 
     # Compute the search space based on the subset of trials containing all parameters.
     distributions = None
-    for trial in study.trials:
-        if trial.state != TrialState.COMPLETE:
-            continue
-
+    for trial in completed_trials:
         trial_distributions = trial.distributions
         if not all(name in trial_distributions for name in params_not_none):
             continue
@@ -100,32 +102,26 @@ def _get_distributions(study: Study, params: Optional[List[str]]) -> Dict[str, B
         ):
             raise ValueError(
                 "Parameters importances cannot be assessed with dynamic search spaces if "
-                "parameters are specified. Specified parameters: {}.".format(params)
+                f"parameters are specified. Specified parameters: {params}."
             )
 
     assert distributions is not None  # Required to pass mypy.
-    distributions = OrderedDict(
+    distributions = dict(
         sorted(distributions.items(), key=lambda name_and_distribution: name_and_distribution[0])
     )
     return distributions
 
 
-def _check_evaluate_args(study: Study, params: Optional[List[str]]) -> None:
-    completed_trials = list(filter(lambda t: t.state == TrialState.COMPLETE, study.trials))
-    if len(completed_trials) == 0:
-        raise ValueError("Cannot evaluate parameter importances without completed trials.")
-    if len(completed_trials) == 1:
-        raise ValueError("Cannot evaluate parameter importances with only a single trial.")
-
+def _check_evaluate_args(completed_trials: list[FrozenTrial], params: list[str] | None) -> None:
     if params is not None:
         if not isinstance(params, (list, tuple)):
             raise TypeError(
-                "Parameters must be specified as a list. Actual parameters: {}.".format(params)
+                f"Parameters must be specified as a list. Actual parameters: {params}."
             )
         if any(not isinstance(p, str) for p in params):
             raise TypeError(
-                "Parameters must be specified by their names with strings. Actual parameters: "
-                "{}.".format(params)
+                f"Parameters must be specified by their names with strings. "
+                f"Actual parameters: {params}."
             )
 
         if len(params) > 0:
@@ -137,5 +133,48 @@ def _check_evaluate_args(study: Study, params: Optional[List[str]]) -> None:
             if not at_least_one_trial:
                 raise ValueError(
                     "Study must contain completed trials with all specified parameters. "
-                    "Specified parameters: {}.".format(params)
+                    f"Specified parameters: {params}."
                 )
+
+
+def _get_filtered_trials(
+    study: Study, params: Collection[str], target: Callable[[FrozenTrial], float] | None
+) -> list[FrozenTrial]:
+    trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+    return [
+        trial
+        for trial in trials
+        if set(params) <= set(trial.params)
+        and np.isfinite(
+            target(trial) if target is not None else cast("float", trial.value)
+        )  # TC006
+    ]
+
+
+def _param_importances_to_dict(
+    params: Collection[str], param_importances: np.ndarray | float
+) -> dict[str, float]:
+    return {
+        name: value
+        for name, value in zip(params, np.broadcast_to(param_importances, (len(params),)))
+    }
+
+
+def _get_trans_params(trials: list[FrozenTrial], trans: _SearchSpaceTransform) -> np.ndarray:
+    return np.array([trans.transform(trial.params) for trial in trials])
+
+
+def _get_target_values(
+    trials: list[FrozenTrial], target: Callable[[FrozenTrial], float] | None
+) -> np.ndarray:
+    return np.array([target(trial) if target is not None else trial.value for trial in trials])
+
+
+def _sort_dict_by_importance(param_importances: dict[str, float]) -> dict[str, float]:
+    return dict(
+        reversed(
+            sorted(
+                param_importances.items(), key=lambda name_and_importance: name_and_importance[1]
+            )
+        )
+    )

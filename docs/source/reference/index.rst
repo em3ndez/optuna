@@ -5,17 +5,18 @@ API Reference
     :maxdepth: 1
 
     optuna
+    artifacts
     cli
     distributions
     exceptions
     importance
     integration
     logging
-    multi_objective/index
     pruners
-    samplers
+    samplers/index
+    search_space
     storages
-    structs
     study
+    terminator
     trial
     visualization/index

@@ -1,18 +1,25 @@
-from collections import OrderedDict
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
+from __future__ import annotations
 
-import numpy
+from typing import TYPE_CHECKING
+
+import numpy as np
 
 from optuna._transform import _SearchSpaceTransform
 from optuna.importance._base import _get_distributions
+from optuna.importance._base import _get_filtered_trials
+from optuna.importance._base import _get_target_values
+from optuna.importance._base import _get_trans_params
+from optuna.importance._base import _param_importances_to_dict
+from optuna.importance._base import _sort_dict_by_importance
 from optuna.importance._base import BaseImportanceEvaluator
 from optuna.importance._fanova._fanova import _Fanova
-from optuna.study import Study
-from optuna.trial import FrozenTrial
-from optuna.trial import TrialState
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from optuna.study import Study
+    from optuna.trial import FrozenTrial
 
 
 class FanovaImportanceEvaluator(BaseImportanceEvaluator):
@@ -20,21 +27,16 @@ class FanovaImportanceEvaluator(BaseImportanceEvaluator):
 
     Implements the fANOVA hyperparameter importance evaluation algorithm in
     `An Efficient Approach for Assessing Hyperparameter Importance
-    <http://proceedings.mlr.press/v32/hutter14.html>`_.
+    <http://proceedings.mlr.press/v32/hutter14.html>`__.
 
-    Given a study, fANOVA fits a random forest regression model that predicts the objective value
-    given a parameter configuration. The more accurate this model is, the more reliable the
-    importances assessed by this class are.
-
-    .. note::
-
-        Requires the `sklearn <https://github.com/scikit-learn/scikit-learn>`_ Python package.
+    fANOVA fits a random forest regression model that predicts the objective values
+    of :class:`~optuna.trial.TrialState.COMPLETE` trials given their parameter configurations.
+    The more accurate this model is, the more reliable the importances assessed
+    by this class are.
 
     .. note::
 
-        Pairwise and higher order importances are not supported through this class. They can be
-        computed using :class:`~optuna.importance._fanova._fanova._Fanova` directly but is not
-        recommended as interfaces may change without prior notice.
+        Requires the `sklearn <https://github.com/scikit-learn/scikit-learn>`__ Python package.
 
     .. note::
 
@@ -59,9 +61,7 @@ class FanovaImportanceEvaluator(BaseImportanceEvaluator):
 
     """
 
-    def __init__(
-        self, *, n_trees: int = 64, max_depth: int = 64, seed: Optional[int] = None
-    ) -> None:
+    def __init__(self, *, n_trees: int = 64, max_depth: int = 64, seed: int | None = None) -> None:
         self._evaluator = _Fanova(
             n_trees=n_trees,
             max_depth=max_depth,
@@ -73,10 +73,10 @@ class FanovaImportanceEvaluator(BaseImportanceEvaluator):
     def evaluate(
         self,
         study: Study,
-        params: Optional[List[str]] = None,
+        params: list[str] | None = None,
         *,
-        target: Optional[Callable[[FrozenTrial], float]] = None,
-    ) -> Dict[str, float]:
+        target: Callable[[FrozenTrial], float] | None = None,
+    ) -> dict[str, float]:
         if target is None and study._is_multi_objective():
             raise ValueError(
                 "If the `study` is being used for multi-objective optimization, "
@@ -84,60 +84,49 @@ class FanovaImportanceEvaluator(BaseImportanceEvaluator):
                 "`target=lambda t: t.values[0]` for the first objective value."
             )
 
-        distributions = _get_distributions(study, params)
-        if len(distributions) == 0:
-            return OrderedDict()
+        distributions = _get_distributions(study, params=params)
+        if params is None:
+            params = list(distributions.keys())
+        assert params is not None
 
-        trials = []
-        for trial in study.trials:
-            if trial.state != TrialState.COMPLETE:
-                continue
-            if any(name not in trial.params for name in distributions.keys()):
-                continue
-            trials.append(trial)
+        # fANOVA does not support parameter distributions with a single value.
+        # However, there is no reason to calculate parameter importance in such case anyway,
+        # since it will always be 0 as the parameter is constant in the objective function.
+        non_single_distributions = {
+            name: dist for name, dist in distributions.items() if not dist.single()
+        }
+        single_distributions = {
+            name: dist for name, dist in distributions.items() if dist.single()
+        }
 
-        trans = _SearchSpaceTransform(distributions, transform_log=False, transform_step=False)
+        if len(non_single_distributions) == 0:
+            return {k: 0.0 for k in single_distributions}
 
-        n_trials = len(trials)
-        trans_params = numpy.empty((n_trials, trans.bounds.shape[0]), dtype=numpy.float64)
-        trans_values = numpy.empty(n_trials, dtype=numpy.float64)
+        trials: list[FrozenTrial] = _get_filtered_trials(study, params=params, target=target)
+        if len(trials) <= 1:
+            return {k: 0.0 for k in params}
 
-        for trial_idx, trial in enumerate(trials):
-            trans_params[trial_idx] = trans.transform(trial.params)
-            trans_values[trial_idx] = trial.value if target is None else target(trial)
+        trans = _SearchSpaceTransform(
+            non_single_distributions, transform_log=False, transform_step=False
+        )
 
-        trans_bounds = trans.bounds
-        column_to_encoded_columns = trans.column_to_encoded_columns
-
-        if trans_params.size == 0:  # `params` were given but as an empty list.
-            return OrderedDict()
-
-        # Many (deep) copies of the search spaces are required during the tree traversal and using
-        # Optuna distributions will create a bottleneck.
-        # Therefore, search spaces (parameter distributions) are represented by a single
-        # `numpy.ndarray`, coupled with a list of flags that indicate whether they are categorical
-        # or not.
+        trans_params: np.ndarray = _get_trans_params(trials, trans)
+        target_values: np.ndarray = _get_target_values(trials, target)
 
         evaluator = self._evaluator
         evaluator.fit(
             X=trans_params,
-            y=trans_values,
-            search_spaces=trans_bounds,
-            column_to_encoded_columns=column_to_encoded_columns,
+            y=target_values,
+            search_spaces=trans.bounds,
+            column_to_encoded_columns=trans.column_to_encoded_columns,
+        )
+        param_importances = np.array(
+            [evaluator.get_importance(i)[0] for i in range(len(non_single_distributions))]
         )
 
-        importances = {}
-        for i, name in enumerate(distributions.keys()):
-            importance, _ = evaluator.get_importance((i,))
-            importances[name] = importance
-
-        total_importance = sum(importances.values())
-        for name in importances:
-            importances[name] /= total_importance
-
-        sorted_importances = OrderedDict(
-            reversed(
-                sorted(importances.items(), key=lambda name_and_importance: name_and_importance[1])
-            )
+        return _sort_dict_by_importance(
+            {
+                **_param_importances_to_dict(non_single_distributions.keys(), param_importances),
+                **_param_importances_to_dict(single_distributions.keys(), 0.0),
+            }
         )
-        return sorted_importances
